@@ -631,7 +631,7 @@ with col_main:
                     box-shadow: 0 4px 6px rgba(0,0,0,0.12);
                     transition: all 0.2s ease;
                 ">
-                    ⚡ Download One-by-One (
+                    ⚡ Download One-by-One (2s Gap - Max Regional Speed)
                 </button>
                 """
                 components.html(js_code, height=60)
@@ -640,7 +640,7 @@ with col_main:
             if st.session_state.zip_bytes:
                 zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
                 st.download_button(
-                    label=f"📦 **Download All (.ZIP) — [{zip_mb:.1f} MB]**",
+                    label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB]**",
                     data=st.session_state.zip_bytes,
                     file_name="broll_assets.zip",
                     mime="application/zip",
