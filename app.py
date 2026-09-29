@@ -38,7 +38,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_WIKIMEDIA_SIZE_MB = 10.0
 UNLIMITED_MEDIA_SIZE_MB = 350.0
 
-GLOBAL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+GLOBAL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between", "from", "by"}
 ARCHIVAL_MODIFIERS = {
     "cinematic", "drone", "4k", "hd", "1080p", "720p", "slow motion", "timelapse",
@@ -136,27 +136,42 @@ TOOLS = {
     "iStock Downloader (Ad-Shielded)": {
         "tag": "istock_adfree",
         "ext": "jpg",
-        "desc": "Clean iStock image fetching with native browser sandboxing to block popup ads and redirect links.",
+        "desc": "Ad-free iStock image extraction engine: paste the iStock photo link to download the high-resolution file directly.",
         "type": "adfree_portal",
-        "portal_url": "https://steptodown.com/istock-downloader/",
+        "service": "istock",
         "auth_key": None,
         "archival": False
     },
     "Shutterstock Downloader (Ad-Shielded)": {
         "tag": "shutterstock_adfree",
         "ext": "jpg",
-        "desc": "Clean Shutterstock image fetching with native browser sandboxing to block popup ads and redirect links.",
+        "desc": "Ad-free Shutterstock image extraction engine: paste the Shutterstock photo link to download the high-resolution file directly.",
         "type": "adfree_portal",
-        "portal_url": "https://steptodown.com/shutterstock-downloader/",
+        "service": "shutterstock",
         "auth_key": None,
         "archival": False
     }
 }
 
 # =====================================================================
-# LIVE ISTOCK & SHUTTERSTOCK DIRECT CATALOG SCRAPERS
+# LIVE CATALOG SEARCH (3 RESULTS PER ROW + HOTLINK BYPASS)
 # =====================================================================
-def search_istock_photos(query: str, max_items: int = 12) -> list[dict]:
+def get_image_bytes_bypassing_hotlink(img_url: str, referer: str) -> bytes | None:
+    headers = {
+        "User-Agent": GLOBAL_USER_AGENT,
+        "Referer": referer,
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+    }
+    try:
+        r = requests.get(img_url, headers=headers, timeout=8)
+        if r.status_code == 200 and len(r.content) > 1000:
+            return r.content
+    except Exception:
+        pass
+    return None
+
+
+def search_istock_photos_3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     url = f"https://www.istockphoto.com/search/2/image?phrase={clean_q}&sort=mostpopular"
     headers = {
@@ -173,52 +188,101 @@ def search_istock_photos(query: str, max_items: int = 12) -> list[dict]:
                 r.text,
                 re.DOTALL
             )
-            for page_path, thumb_url, alt_text in matches[:max_items]:
+            for page_path, thumb_url, alt_text in matches:
                 full_page_url = f"https://www.istockphoto.com{page_path}" if not page_path.startswith("http") else page_path
-                results.append({
-                    "title": alt_text.strip() or "iStock Photo",
-                    "preview_url": thumb_url,
-                    "target_url": full_page_url
-                })
+                img_data = get_image_bytes_bypassing_hotlink(thumb_url, "https://www.istockphoto.com/")
+                if img_data:
+                    results.append({
+                        "title": alt_text.strip() or "iStock Photo",
+                        "image_bytes": img_data,
+                        "target_url": full_page_url
+                    })
+                if len(results) == 3:
+                    break
     except Exception:
         pass
     return results
 
 
-def search_shutterstock_photos(query: str, max_items: int = 12) -> list[dict]:
+def search_shutterstock_photos_3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
-    url = f"https://www.shutterstock.com/search/{clean_q}"
+    url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
     headers = {
         "User-Agent": GLOBAL_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
+        "Accept": "application/json",
+        "Referer": f"https://www.shutterstock.com/search/{clean_q}"
     }
     results = []
     try:
-        r = requests.get(url, headers=headers, timeout=12)
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
-            img_blocks = re.findall(
-                r'href="(/image-photo/[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"',
-                r.text,
-                re.DOTALL
-            )
-            if not img_blocks:
-                img_blocks = re.findall(
-                    r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"',
-                    r.text,
-                    re.DOTALL
-                )
-
-            for page_path, thumb_url, alt_text in img_blocks[:max_items]:
-                full_page_url = f"https://www.shutterstock.com{page_path}" if not page_path.startswith("http") else page_path
-                results.append({
-                    "title": alt_text.strip() or "Shutterstock Photo",
-                    "preview_url": thumb_url,
-                    "target_url": full_page_url
-                })
+            data = r.json()
+            assets = data.get("pageProps", {}).get("initialState", {}).get("search", {}).get("results", {}).get("data", [])
+            for item in assets:
+                img_id = item.get("id")
+                desc = item.get("description", "Shutterstock Photo")
+                thumb_url = item.get("displays", {}).get("260nw", {}).get("src") or item.get("displays", {}).get("preview", {}).get("src")
+                if img_id and thumb_url:
+                    full_page_url = f"https://www.shutterstock.com/image-photo/{img_id}"
+                    img_data = get_image_bytes_bypassing_hotlink(thumb_url, "https://www.shutterstock.com/")
+                    if img_data:
+                        results.append({
+                            "title": desc,
+                            "image_bytes": img_data,
+                            "target_url": full_page_url
+                        })
+                if len(results) == 3:
+                    break
     except Exception:
         pass
+
+    # HTML scraping fallback
+    if len(results) < 3:
+        try:
+            h_url = f"https://www.shutterstock.com/search/{clean_q}"
+            h_headers = {"User-Agent": GLOBAL_USER_AGENT}
+            hr = requests.get(h_url, headers=h_headers, timeout=10)
+            if hr.status_code == 200:
+                matches = re.findall(r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"', hr.text, re.DOTALL)
+                for path, thumb, alt in matches:
+                    full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
+                    img_data = get_image_bytes_bypassing_hotlink(thumb, "https://www.shutterstock.com/")
+                    if img_data:
+                        results.append({
+                            "title": alt.strip() or "Shutterstock Photo",
+                            "image_bytes": img_data,
+                            "target_url": full_url
+                        })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
     return results
+
+
+# Direct Downloader Resolver (Bypasses StepToDown Advertisements)
+def resolve_clean_steptodown_link(asset_url: str, service: str) -> tuple[bool, str]:
+    headers = {
+        "User-Agent": GLOBAL_USER_AGENT,
+        "Referer": f"https://steptodown.com/{service}-downloader/"
+    }
+    endpoint = f"https://steptodown.com/{service}-downloader/get.php"
+    try:
+        payload = {"url": asset_url.strip()}
+        r = requests.post(endpoint, data=payload, headers=headers, timeout=20)
+        if r.status_code == 200:
+            dl_matches = re.findall(r'href="([^"]+)"[^>]*class="[^"]*btn[^"]*"', r.text)
+            if not dl_matches:
+                dl_matches = re.findall(r'href="(https?://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', r.text, re.IGNORECASE)
+            
+            for link in dl_matches:
+                if "steptodown.com" not in link and not link.endswith(".php"):
+                    return True, link
+            return False, "Could not locate direct media asset. Ensure the provided URL is valid."
+        return False, f"Server responded with status {r.status_code}."
+    except Exception as e:
+        return False, str(e)
 
 
 # =====================================================================
@@ -310,7 +374,7 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
 
 
 # =====================================================================
-# BATCH FETCH ENGINES
+# BATCH REPOSITORIES
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -697,7 +761,7 @@ if "catalog_search_query" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives + Stock Search & Link Extractors")
+    st.caption("⚡ Modern Stock + Public Domain Archives + Stock Search & Clean Resolvers")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -733,12 +797,12 @@ with col_main:
     st.info(tool_info["desc"])
 
     # =================================================================
-    # TOOL A: CATALOG EXPLORERS (ISTOCK & SHUTTERSTOCK SEARCH & COPY URL)
+    # TOOL A: 3-IMAGE ROW CATALOG EXPLORER (HOTLINK-BYPASSED PREVIEWS)
     # =================================================================
     if tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
-        st.caption(f"Enter any prompt below to search {source_brand.capitalize()}. Browse matches and click **📋 Copy Link** to copy the target URL to your clipboard.")
+        st.caption(f"Enter any visual prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
 
         col_search_bar, col_search_go = st.columns([3, 1])
         with col_search_bar:
@@ -755,37 +819,37 @@ with col_main:
                 st.warning("Please enter a search prompt.")
             else:
                 st.session_state.catalog_search_query = catalog_query.strip()
-                with st.spinner(f"Querying {source_brand.capitalize()} live catalog..."):
+                with st.spinner(f"Querying {source_brand.capitalize()} and loading previews..."):
                     if source_brand == "istock":
-                        items = search_istock_photos(catalog_query)
+                        items = search_istock_photos_3(catalog_query)
                     else:
-                        items = search_shutterstock_photos(catalog_query)
+                        items = search_shutterstock_photos_3(catalog_query)
 
                     st.session_state.catalog_search_results = items
 
                 if not items:
                     st.error(f"No results returned from {source_brand.capitalize()}. Try broader keywords.")
                 else:
-                    st.success(f"✓ Found {len(items)} matching photos from {source_brand.capitalize()}!")
+                    st.success(f"✓ Displaying top 3 results from {source_brand.capitalize()}!")
 
-        # Render 3-column photo grid with interactive copy buttons
+        # Render exactly 3 photos in a single row
         if st.session_state.catalog_search_results:
             st.markdown("---")
-            st.markdown(f"#### **Results for: *\"{st.session_state.catalog_search_query}\"***")
+            st.markdown(f"#### **Top 3 Results for: *\"{st.session_state.catalog_search_query}\"***")
 
-            items = st.session_state.catalog_search_results
-            grid_cols = st.columns(3)
+            items = st.session_state.catalog_search_results[:3]
+            cols = st.columns(3)
+
             for idx, item in enumerate(items):
-                col = grid_cols[idx % 3]
-                with col:
-                    st.image(item["preview_url"], use_container_width=True)
-                    st.caption(f"**{item['title'][:45]}...**" if len(item['title']) > 45 else f"**{item['title']}**")
+                with cols[idx]:
+                    # Render image bytes directly (bypasses browser hotlink protection)
+                    st.image(item["image_bytes"], use_container_width=True)
+                    st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
 
-                    # Lightweight HTML/JS 1-click clipboard button
                     raw_url = item["target_url"]
                     btn_id = f"cp_btn_{idx}"
                     copy_component_html = f"""
-                    <div style="margin-bottom: 22px;">
+                    <div style="margin-bottom: 15px;">
                         <input type="text" value="{raw_url}" id="url_val_{idx}" readonly style="
                             width: 100%;
                             padding: 6px 8px;
@@ -825,35 +889,36 @@ with col_main:
                     components.html(copy_component_html, height=85)
 
     # =================================================================
-    # TOOL B: AD-SHIELDED WEB PORTALS (ISTOCK & SHUTTERSTOCK)
+    # TOOL B: AD-SHIELDED DIRECT DOWNLOAD RESOLVERS
     # =================================================================
     elif tool_info["type"] == "adfree_portal":
-        st.markdown(f"#### 🛡️ **{selected_tool_name} (Browser Ad-Shield Active)**")
-        st.caption("Paste any target image URL into the portal below. **All popup ads, new-tab click-jackers, and redirect scripts are strictly blocked by native HTML5 sandboxing.**")
+        service_name = tool_info["service"]
+        st.markdown(f"#### 🛡️ **{selected_tool_name}**")
+        st.caption(f"Paste your {service_name.capitalize()} photo URL below. The server will resolve and download the clean high-resolution file directly, bypassing all popups and advertising redirects.")
 
-        target_portal = tool_info["portal_url"]
+        target_url_input = st.text_input(
+            f"Paste {service_name.capitalize()} Photo URL:",
+            placeholder=f"https://www.{service_name}.com/photo/..." if service_name == "istock" else "https://www.shutterstock.com/image-photo/..."
+        )
 
-        ad_shielded_html = f"""
-        <div style="border: 2px solid #00C853; border-radius: 10px; overflow: hidden; background: #ffffff;">
-            <div style="background: #00C853; color: white; padding: 8px 16px; font-weight: bold; font-size: 14px;">
-                🛡️ Active Browser Shield: Popups, click-jackers, and redirects are blocked
-            </div>
-            <iframe 
-                src="{target_portal}" 
-                sandbox="allow-forms allow-scripts allow-same-origin allow-downloads"
-                style="width: 100%; height: 780px; border: none;"
-                title="{selected_tool_name}">
-            </iframe>
-        </div>
-        """
-        components.html(ad_shielded_html, height=830)
+        if st.button(f"⚡ **Resolve & Download {service_name.capitalize()} Asset**", type="primary", use_container_width=True):
+            if not target_url_input.strip():
+                st.warning("Please enter a valid photo link.")
+            else:
+                with st.spinner("Extracting media asset without advertisements..."):
+                    ok_res, direct_or_err = resolve_clean_steptodown_link(target_url_input, service_name)
 
-        st.markdown("---")
-        c_alt1, c_alt2 = st.columns(2)
-        with c_alt1:
-            st.caption("ℹ️ *If you prefer opening the external site in a separate browser tab:*")
-        with c_alt2:
-            st.link_button(f"🌐 Open {selected_tool_name} in New Tab", target_portal, use_container_width=True)
+                if ok_res:
+                    st.success("✓ Asset resolved successfully!")
+                    c_link, c_open = st.columns(2)
+                    with c_link:
+                        st.link_button("⬇️ Download High-Res File (Direct CDN)", direct_or_err, type="primary", use_container_width=True)
+                    with c_open:
+                        st.link_button("🌐 Open Source File in Browser", direct_or_err, use_container_width=True)
+                else:
+                    st.error(f"✖ Extraction failed: {direct_or_err}")
+                    st.caption("ℹ️ *You can also open the original provider endpoint below:*")
+                    st.link_button(f"Open {service_name.capitalize()} Portal Directly", f"https://steptodown.com/{service_name}-downloader/", use_container_width=True)
 
     # =================================================================
     # TOOL C: STOCK & ARCHIVAL BATCH SOURCING
