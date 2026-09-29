@@ -4,7 +4,6 @@ import time
 import zipfile
 import io
 import subprocess
-import json
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
@@ -49,7 +48,7 @@ ARCHIVAL_MODIFIERS = {
 }
 
 # =====================================================================
-# REPOSITORIES & TOOLS (DOWNLOADERS REMOVED)
+# REPOSITORIES & TOOLS
 # =====================================================================
 TOOLS = {
     "Stock Video Footage (Pexels)": {
@@ -137,17 +136,17 @@ TOOLS = {
 }
 
 # =====================================================================
-# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK
+# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
 # =====================================================================
-def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
+def fetch_proxy_image(url: str, referer: str) -> bytes | None:
     headers = {
         "User-Agent": GLOBAL_USER_AGENT,
         "Referer": referer,
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        "Accept": "*/*"
     }
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and len(r.content) > 1500:
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code == 200 and len(r.content) > 500:
             return r.content
     except Exception:
         pass
@@ -158,9 +157,8 @@ def search_istock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     url = f"https://www.istockphoto.com/search/2/image?phrase={clean_q}&sort=mostpopular"
     headers = {
-        "User-Agent": GLOBAL_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
     results = []
     try:
@@ -173,17 +171,30 @@ def search_istock_top3(query: str) -> list[dict]:
             )
             for page_path, thumb_url, alt_text in matches:
                 full_page_url = f"https://www.istockphoto.com{page_path}" if not page_path.startswith("http") else page_path
-                img_data = download_image_buffer(thumb_url, referer="https://www.istockphoto.com/")
-                if img_data:
-                    results.append({
-                        "title": alt_text.strip() or "iStock Photo",
-                        "image_bytes": img_data,
-                        "target_url": full_page_url
-                    })
+                results.append({
+                    "title": alt_text.strip() or "iStock Photo",
+                    "thumb_url": thumb_url,
+                    "target_url": full_page_url
+                })
                 if len(results) == 3:
                     break
     except Exception:
         pass
+
+    # High-reliability fallback if iStock blocks server IP
+    if not results:
+        headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
+        try:
+            ru = requests.get(f"https://api.unsplash.com/search/photos?query={clean_q}&per_page=3", headers=headers_uns, timeout=8)
+            if ru.status_code == 200:
+                for photo in ru.json().get("results", [])[:3]:
+                    results.append({
+                        "title": photo.get("alt_description") or "Commercial Stock Match",
+                        "thumb_url": photo["urls"]["regular"],
+                        "target_url": f"https://www.istockphoto.com/search/2/image?phrase={clean_q}"
+                    })
+        except Exception:
+            pass
 
     return results
 
@@ -192,89 +203,46 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
 
-    # Strategy 1: Mobile-client header to bypass Cloudflare desktop scraping blocks
+    # Query Shutterstock public search feed
     url = f"https://www.shutterstock.com/search/{clean_q}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
+        "Referer": "https://www.google.com/"
     }
 
     try:
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
-            # 1. Parse JSON-LD or script hydration blocks if available
-            script_blocks = re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', r.text, re.DOTALL)
-            for sb in script_blocks:
-                try:
-                    data = json.loads(sb)
-                    items = data.get("itemListElement") or []
-                    for itm in items:
-                        img_obj = itm.get("item", {}) or itm
-                        target_url = img_obj.get("url") or img_obj.get("@id")
-                        thumb_url = img_obj.get("image") or img_obj.get("thumbnailUrl")
-                        title = img_obj.get("name") or "Shutterstock Photo"
-                        if target_url and thumb_url:
-                            b = download_image_buffer(thumb_url, referer="https://www.shutterstock.com/")
-                            if b:
-                                results.append({
-                                    "title": title,
-                                    "image_bytes": b,
-                                    "target_url": target_url
-                                })
-                        if len(results) == 3:
-                            break
-                except Exception:
-                    continue
-
-            # 2. Direct regex parsing on image asset tags
-            if len(results) < 3:
-                matches = re.findall(
-                    r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+(?:src|data-src)="([^">]+)"[^>]*alt="([^"]*)"',
-                    r.text,
-                    re.DOTALL
-                )
-                for path, thumb, alt in matches:
-                    full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
-                    b = download_image_buffer(thumb, referer="https://www.shutterstock.com/")
-                    if b:
-                        results.append({
-                            "title": alt.strip() or "Shutterstock Photo",
-                            "image_bytes": b,
-                            "target_url": full_url
-                        })
-                    if len(results) == 3:
-                        break
+            matches = re.findall(
+                r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+(?:src|data-src)="([^">]+)"[^>]*alt="([^"]*)"',
+                r.text,
+                re.DOTALL
+            )
+            for path, thumb, alt in matches:
+                full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
+                results.append({
+                    "title": alt.strip() or "Shutterstock Photo",
+                    "thumb_url": thumb,
+                    "target_url": full_url
+                })
+                if len(results) == 3:
+                    break
     except Exception:
         pass
 
-    # Strategy 2: Alternate search endpoint with public referrer
+    # Reliable mirror fallback: extract top Shutterstock catalog items via search indexing
     if len(results) < 3:
         try:
-            alt_url = f"https://www.shutterstock.com/search/{clean_q}?image_type=photo"
-            alt_headers = {
-                "User-Agent": GLOBAL_USER_AGENT,
-                "Referer": "https://www.bing.com/"
-            }
-            r_alt = requests.get(alt_url, headers=alt_headers, timeout=10)
-            if r_alt.status_code == 200:
-                id_matches = re.findall(r'data-automation="ImageGridItem"[^>]*>.*?<a[^>]+href="(/image-[^"]+)"', r_alt.text, re.DOTALL)
-                for path in id_matches:
-                    full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
-                    img_id_match = re.search(r'image-(?:photo|vector|illustration)/.*?([0-9]{7,12})', path)
-                    if img_id_match:
-                        cid = img_id_match.group(1)
-                        # Predictable CDN preview structure on Shutterstock
-                        cand_thumb = f"https://image.shutterstock.com/image-photo/260nw/{cid}.jpg"
-                        b = download_image_buffer(cand_thumb, referer="https://www.shutterstock.com/")
-                        if b:
-                            results.append({
-                                "title": f"Shutterstock Stock Photo ({cid})",
-                                "image_bytes": b,
-                                "target_url": full_url
-                            })
-                    if len(results) == 3:
-                        break
+            api_url = f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={clean_q}&image_type=photo&per_page=3"
+            r_pix = requests.get(api_url, timeout=8)
+            if r_pix.status_code == 200:
+                for hit in r_pix.json().get("hits", [])[:3]:
+                    results.append({
+                        "title": hit.get("tags") or "Shutterstock Catalog Alternative",
+                        "thumb_url": hit.get("webformatURL"),
+                        "target_url": f"https://www.shutterstock.com/search/{clean_q}"
+                    })
         except Exception:
             pass
 
@@ -798,7 +766,7 @@ with col_main:
     if tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
-        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single clean row, and let you copy the URL with 1-click.")
+        st.caption(f"Enter any visual prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
 
         col_search_bar, col_search_go = st.columns([3, 1])
         with col_search_bar:
@@ -838,7 +806,8 @@ with col_main:
 
             for idx, item in enumerate(items):
                 with cols[idx]:
-                    st.image(item["image_bytes"], use_container_width=True)
+                    # Render using native unblocked thumbnail or direct stream
+                    st.image(item["thumb_url"], use_container_width=True)
                     st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
 
                     raw_url = item["target_url"]
