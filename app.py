@@ -4,6 +4,7 @@ import time
 import zipfile
 import io
 import subprocess
+import json
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
@@ -138,15 +139,15 @@ TOOLS = {
 # =====================================================================
 # LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
 # =====================================================================
-def fetch_proxy_image(url: str, referer: str) -> bytes | None:
+def fetch_image_bytes_with_referer(url: str, referer: str) -> bytes | None:
     headers = {
         "User-Agent": GLOBAL_USER_AGENT,
         "Referer": referer,
-        "Accept": "*/*"
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
     }
     try:
         r = requests.get(url, headers=headers, timeout=8)
-        if r.status_code == 200 and len(r.content) > 500:
+        if r.status_code == 200 and len(r.content) > 1000:
             return r.content
     except Exception:
         pass
@@ -157,8 +158,9 @@ def search_istock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     url = f"https://www.istockphoto.com/search/2/image?phrase={clean_q}&sort=mostpopular"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
     results = []
     try:
@@ -171,9 +173,14 @@ def search_istock_top3(query: str) -> list[dict]:
             )
             for page_path, thumb_url, alt_text in matches:
                 full_page_url = f"https://www.istockphoto.com{page_path}" if not page_path.startswith("http") else page_path
+                
+                # Fetch image bytes on backend to eliminate client-side referer block
+                img_data = fetch_image_bytes_with_referer(thumb_url, "https://www.istockphoto.com/")
+                preview_content = img_data if img_data else thumb_url
+
                 results.append({
                     "title": alt_text.strip() or "iStock Photo",
-                    "thumb_url": thumb_url,
+                    "preview": preview_content,
                     "target_url": full_page_url
                 })
                 if len(results) == 3:
@@ -190,7 +197,7 @@ def search_istock_top3(query: str) -> list[dict]:
                 for photo in ru.json().get("results", [])[:3]:
                     results.append({
                         "title": photo.get("alt_description") or "Commercial Stock Match",
-                        "thumb_url": photo["urls"]["regular"],
+                        "preview": photo["urls"]["regular"],
                         "target_url": f"https://www.istockphoto.com/search/2/image?phrase={clean_q}"
                     })
         except Exception:
@@ -203,7 +210,6 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
 
-    # Query Shutterstock public search feed
     url = f"https://www.shutterstock.com/search/{clean_q}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -221,9 +227,11 @@ def search_shutterstock_top3(query: str) -> list[dict]:
             )
             for path, thumb, alt in matches:
                 full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
+                img_data = fetch_image_bytes_with_referer(thumb, "https://www.shutterstock.com/")
+                preview_content = img_data if img_data else thumb
                 results.append({
                     "title": alt.strip() or "Shutterstock Photo",
-                    "thumb_url": thumb,
+                    "preview": preview_content,
                     "target_url": full_url
                 })
                 if len(results) == 3:
@@ -240,7 +248,7 @@ def search_shutterstock_top3(query: str) -> list[dict]:
                 for hit in r_pix.json().get("hits", [])[:3]:
                     results.append({
                         "title": hit.get("tags") or "Shutterstock Catalog Alternative",
-                        "thumb_url": hit.get("webformatURL"),
+                        "preview": hit.get("webformatURL"),
                         "target_url": f"https://www.shutterstock.com/search/{clean_q}"
                     })
         except Exception:
@@ -766,7 +774,7 @@ with col_main:
     if tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
-        st.caption(f"Enter any visual prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
+        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single clean row, and let you copy the URL with 1-click.")
 
         col_search_bar, col_search_go = st.columns([3, 1])
         with col_search_bar:
@@ -806,8 +814,7 @@ with col_main:
 
             for idx, item in enumerate(items):
                 with cols[idx]:
-                    # Render using native unblocked thumbnail or direct stream
-                    st.image(item["thumb_url"], use_container_width=True)
+                    st.image(item["preview"], use_container_width=True)
                     st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
 
                     raw_url = item["target_url"]
