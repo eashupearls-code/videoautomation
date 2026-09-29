@@ -4,6 +4,7 @@ import time
 import zipfile
 import io
 import subprocess
+import json
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
@@ -48,7 +49,7 @@ ARCHIVAL_MODIFIERS = {
 }
 
 # =====================================================================
-# REPOSITORIES & TOOLS
+# REPOSITORIES & TOOLS (DOWNLOADERS REMOVED)
 # =====================================================================
 TOOLS = {
     "Stock Video Footage (Pexels)": {
@@ -118,7 +119,7 @@ TOOLS = {
     "iStock Photo Explorer (Search & Copy URL)": {
         "tag": "istock_search",
         "ext": "jpg",
-        "desc": "Search live iStock catalog by prompt, preview top 3 matches in a clean row, and copy official URLs with 1-click.",
+        "desc": "Search live iStock catalog by prompt, preview top 3 matches in a single row, and copy official URLs with 1-click.",
         "type": "catalog_explorer",
         "source": "istock",
         "auth_key": None,
@@ -127,34 +128,16 @@ TOOLS = {
     "Shutterstock Photo Explorer (Search & Copy URL)": {
         "tag": "shutterstock_search",
         "ext": "jpg",
-        "desc": "Search live Shutterstock catalog by prompt, preview top 3 matches in a clean row, and copy official URLs with 1-click.",
+        "desc": "Search live Shutterstock catalog by prompt, preview top 3 matches in a single row, and copy official URLs with 1-click.",
         "type": "catalog_explorer",
         "source": "shutterstock",
-        "auth_key": None,
-        "archival": False
-    },
-    "iStock Downloader": {
-        "tag": "istock_portal",
-        "ext": "jpg",
-        "desc": "Direct interactive iStock image downloader portal with full script and download support.",
-        "type": "web_portal",
-        "portal_url": "https://steptodown.com/istock-downloader/",
-        "auth_key": None,
-        "archival": False
-    },
-    "Shutterstock Downloader": {
-        "tag": "shutterstock_portal",
-        "ext": "jpg",
-        "desc": "Direct interactive Shutterstock image downloader portal with full script and download support.",
-        "type": "web_portal",
-        "portal_url": "https://steptodown.com/shutterstock-downloader/",
         "auth_key": None,
         "archival": False
     }
 }
 
 # =====================================================================
-# LIVE CATALOG SEARCH ENGINES (HOTLINK & SCRAPING BYPASS)
+# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK
 # =====================================================================
 def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
     headers = {
@@ -202,24 +185,6 @@ def search_istock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # Unsplash editorial fallback if iStock restricts cloud datacenter IP
-    if not results:
-        headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
-        try:
-            ru = requests.get(f"https://api.unsplash.com/search/photos?query={clean_q}&per_page=3", headers=headers_uns, timeout=8)
-            if ru.status_code == 200:
-                for photo in ru.json().get("results", [])[:3]:
-                    t_url = photo["urls"].get("small") or photo["urls"].get("regular")
-                    b = download_image_buffer(t_url)
-                    if b:
-                        results.append({
-                            "title": photo.get("alt_description") or "Commercial Stock Match",
-                            "image_bytes": b,
-                            "target_url": photo["links"]["html"]
-                        })
-        except Exception:
-            pass
-
     return results
 
 
@@ -227,57 +192,87 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
 
-    # Method 1: Shutterstock Public Client API (Cleanest & Most Reliable)
-    api_url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
-    headers_api = {
-        "User-Agent": GLOBAL_USER_AGENT,
-        "Accept": "application/json",
-        "Referer": f"https://www.shutterstock.com/search/{clean_q}"
+    # Strategy 1: Mobile-client header to bypass Cloudflare desktop scraping blocks
+    url = f"https://www.shutterstock.com/search/{clean_q}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
-    try:
-        r = requests.get(api_url, headers=headers_api, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            assets = data.get("pageProps", {}).get("initialState", {}).get("search", {}).get("results", {}).get("data", [])
-            for item in assets:
-                img_id = item.get("id")
-                desc = item.get("description", "Shutterstock Photo")
-                thumb_url = item.get("displays", {}).get("260nw", {}).get("src") or item.get("displays", {}).get("preview", {}).get("src")
-                if img_id and thumb_url:
-                    full_page_url = f"https://www.shutterstock.com/image-photo/{img_id}"
-                    img_data = download_image_buffer(thumb_url, referer="https://www.shutterstock.com/")
-                    if img_data:
-                        results.append({
-                            "title": desc,
-                            "image_bytes": img_data,
-                            "target_url": full_page_url
-                        })
-                if len(results) == 3:
-                    break
-    except Exception:
-        pass
 
-    # Method 2: Direct Search Scraping Fallback
-    if len(results) < 3:
-        try:
-            h_url = f"https://www.shutterstock.com/search/{clean_q}"
-            h_headers = {"User-Agent": GLOBAL_USER_AGENT}
-            hr = requests.get(h_url, headers=h_headers, timeout=10)
-            if hr.status_code == 200:
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            # 1. Parse JSON-LD or script hydration blocks if available
+            script_blocks = re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', r.text, re.DOTALL)
+            for sb in script_blocks:
+                try:
+                    data = json.loads(sb)
+                    items = data.get("itemListElement") or []
+                    for itm in items:
+                        img_obj = itm.get("item", {}) or itm
+                        target_url = img_obj.get("url") or img_obj.get("@id")
+                        thumb_url = img_obj.get("image") or img_obj.get("thumbnailUrl")
+                        title = img_obj.get("name") or "Shutterstock Photo"
+                        if target_url and thumb_url:
+                            b = download_image_buffer(thumb_url, referer="https://www.shutterstock.com/")
+                            if b:
+                                results.append({
+                                    "title": title,
+                                    "image_bytes": b,
+                                    "target_url": target_url
+                                })
+                        if len(results) == 3:
+                            break
+                except Exception:
+                    continue
+
+            # 2. Direct regex parsing on image asset tags
+            if len(results) < 3:
                 matches = re.findall(
-                    r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"',
-                    hr.text,
+                    r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+(?:src|data-src)="([^">]+)"[^>]*alt="([^"]*)"',
+                    r.text,
                     re.DOTALL
                 )
                 for path, thumb, alt in matches:
                     full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
-                    img_data = download_image_buffer(thumb, referer="https://www.shutterstock.com/")
-                    if img_data:
+                    b = download_image_buffer(thumb, referer="https://www.shutterstock.com/")
+                    if b:
                         results.append({
                             "title": alt.strip() or "Shutterstock Photo",
-                            "image_bytes": img_data,
+                            "image_bytes": b,
                             "target_url": full_url
                         })
+                    if len(results) == 3:
+                        break
+    except Exception:
+        pass
+
+    # Strategy 2: Alternate search endpoint with public referrer
+    if len(results) < 3:
+        try:
+            alt_url = f"https://www.shutterstock.com/search/{clean_q}?image_type=photo"
+            alt_headers = {
+                "User-Agent": GLOBAL_USER_AGENT,
+                "Referer": "https://www.bing.com/"
+            }
+            r_alt = requests.get(alt_url, headers=alt_headers, timeout=10)
+            if r_alt.status_code == 200:
+                id_matches = re.findall(r'data-automation="ImageGridItem"[^>]*>.*?<a[^>]+href="(/image-[^"]+)"', r_alt.text, re.DOTALL)
+                for path in id_matches:
+                    full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
+                    img_id_match = re.search(r'image-(?:photo|vector|illustration)/.*?([0-9]{7,12})', path)
+                    if img_id_match:
+                        cid = img_id_match.group(1)
+                        # Predictable CDN preview structure on Shutterstock
+                        cand_thumb = f"https://image.shutterstock.com/image-photo/260nw/{cid}.jpg"
+                        b = download_image_buffer(cand_thumb, referer="https://www.shutterstock.com/")
+                        if b:
+                            results.append({
+                                "title": f"Shutterstock Stock Photo ({cid})",
+                                "image_bytes": b,
+                                "target_url": full_url
+                            })
                     if len(results) == 3:
                         break
         except Exception:
@@ -762,7 +757,7 @@ if "catalog_search_query" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives + Stock Search & Direct Download Portals")
+    st.caption("⚡ Modern Stock + Public Domain Archives + Stock Search & Link Extractors")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -803,7 +798,7 @@ with col_main:
     if tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
-        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
+        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single clean row, and let you copy the URL with 1-click.")
 
         col_search_bar, col_search_go = st.columns([3, 1])
         with col_search_bar:
@@ -889,38 +884,7 @@ with col_main:
                     components.html(copy_component_html, height=85)
 
     # =================================================================
-    # TOOL B: INTERACTIVE DOWNLOADER PORTALS (WITH ADS & SCRIPTS ENABLED)
-    # =================================================================
-    elif tool_info["type"] == "web_portal":
-        target_portal = tool_info["portal_url"]
-        st.markdown(f"#### 🌐 **{selected_tool_name}**")
-        st.caption("Paste your copied photo link into the portal below and click download. All scripts, popups, and downloads are fully enabled.")
-
-        # Full-featured portal embed (no restrictive sandboxing to ensure conversions process)
-        full_portal_html = f"""
-        <div style="border: 2px solid #0969da; border-radius: 10px; overflow: hidden; background: #ffffff;">
-            <div style="background: #0969da; color: white; padding: 10px 18px; font-weight: bold; font-size: 14px;">
-                ⚡ Interactive Downloader Portal (Active)
-            </div>
-            <iframe 
-                src="{target_portal}" 
-                style="width: 100%; height: 820px; border: none;"
-                allow="downloads"
-                title="{selected_tool_name}">
-            </iframe>
-        </div>
-        """
-        components.html(full_portal_html, height=860)
-
-        st.markdown("---")
-        c_open1, c_open2 = st.columns([2, 1])
-        with c_open1:
-            st.caption("ℹ️ *If the frame above is ever blocked by your browser extensions, you can open it in a new window:*")
-        with c_open2:
-            st.link_button(f"🌐 Open {selected_tool_name} in New Tab", target_portal, use_container_width=True)
-
-    # =================================================================
-    # TOOL C: STOCK & ARCHIVAL BATCH SOURCING
+    # TOOL B: STOCK & ARCHIVAL BATCH SOURCING
     # =================================================================
     else:
         auth_key_name = tool_info.get("auth_key")
