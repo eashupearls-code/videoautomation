@@ -48,7 +48,7 @@ ARCHIVAL_MODIFIERS = {
 }
 
 # =====================================================================
-# REPOSITORIES & TOOLS
+# REPOSITORIES & TOOLS (DOWNLOADERS EXCLUDED)
 # =====================================================================
 TOOLS = {
     "Stock Video Footage (Pexels)": {
@@ -136,7 +136,7 @@ TOOLS = {
 }
 
 # =====================================================================
-# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
+# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-IMAGE ROW)
 # =====================================================================
 def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
     headers = {
@@ -146,7 +146,7 @@ def download_image_buffer(url: str, referer: str = "https://www.google.com/") ->
     }
     try:
         r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and len(r.content) > 1000:
+        if r.status_code == 200 and len(r.content) > 1500:
             return r.content
     except Exception:
         pass
@@ -184,6 +184,7 @@ def search_istock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
+    # Unsplash fallback if iStock blocks server IP
     if not results:
         headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
         try:
@@ -208,6 +209,7 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
 
+    # Method 1: Shutterstock Next.js Search Hydration Endpoint
     api_url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
     headers_api = {
         "User-Agent": GLOBAL_USER_AGENT,
@@ -242,6 +244,7 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
+    # Method 2: HTML Search Parsing
     if len(results) < 3:
         try:
             h_url = f"https://www.shutterstock.com/search/{clean_q}"
@@ -271,6 +274,7 @@ def search_shutterstock_top3(query: str) -> list[dict]:
         except Exception:
             pass
 
+    # Method 3: Clean Fallback
     if len(results) < 3:
         try:
             api_url = f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={clean_q}&image_type=photo&per_page=3"
@@ -360,40 +364,9 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
         return False, str(e)
 
 
-# =====================================================================
-# GUARANTEED PRECISE 10s/15s SLICE PIPELINE
-# =====================================================================
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
-    """
-    Directly streams from CDN and cuts exactly duration_sec (10 or 15 seconds)
-    using ultrafast H.264 encoding with Web-optimized index headers.
-    """
-    cmd = [
-        FFMPEG_EXE, "-y",
-        "-user_agent", GLOBAL_USER_AGENT,
-        "-ss", "00:00:00",
-        "-i", cdn_url,
-        "-t", str(duration_sec),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "22",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            sz_mb = os.path.getsize(output_path) / (1024 * 1024)
-            return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
-    except Exception:
-        pass
-
-    # Method 2: Stream-copy fallback
     cmd_copy = [
         FFMPEG_EXE, "-y",
-        "-user_agent", GLOBAL_USER_AGENT,
         "-ss", "00:00:00",
         "-i", cdn_url,
         "-t", str(duration_sec),
@@ -402,14 +375,14 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
         output_path
     ]
     try:
-        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=18)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             sz_mb = os.path.getsize(output_path) / (1024 * 1024)
             return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
-    except Exception as e:
-        return False, f"Trimming error: {e}"
+    except Exception:
+        pass
 
-    return False, "Could not slice video to specified duration."
+    return download_stream(cdn_url, output_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
 
 
 # =====================================================================
@@ -841,7 +814,7 @@ with col_main:
     if tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
-        st.caption(f"Enter any visual prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
+        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single clean row, and let you copy the URL with 1-click.")
 
         col_search_bar, col_search_go = st.columns([3, 1])
         with col_search_bar:
