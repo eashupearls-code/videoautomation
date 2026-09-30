@@ -365,7 +365,7 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
 # =====================================================================
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
     """
-    Downloads and cuts the first duration_sec (10 or 15 seconds)
+    Directly streams from CDN and cuts exactly duration_sec (10 or 15 seconds)
     using ultrafast H.264 encoding with Web-optimized index headers.
     """
     cmd = [
@@ -383,14 +383,14 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
         output_path
     ]
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             sz_mb = os.path.getsize(output_path) / (1024 * 1024)
             return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
     except Exception:
         pass
 
-    # Stream-copy fallback
+    # Method 2: Stream-copy fallback
     cmd_copy = [
         FFMPEG_EXE, "-y",
         "-user_agent", GLOBAL_USER_AGENT,
@@ -706,15 +706,6 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
 
     elapsed = time.time() - t0
 
-    # Read bytes for exact file-slice downloads
-    file_bytes = None
-    if ok and os.path.exists(out_path):
-        try:
-            with open(out_path, "rb") as f:
-                file_bytes = f.read()
-        except Exception:
-            pass
-
     return {
         "prompt": prompt,
         "filename": filename,
@@ -723,7 +714,6 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
         "ok": ok,
         "detail": detail,
         "cdn_url": cdn_url,
-        "file_bytes": file_bytes,
         "elapsed": elapsed
     }
 
@@ -944,7 +934,7 @@ with col_main:
         if auth_key_name:
             current_key = globals().get(auth_key_name, "")
             if not current_key:
-                st.warning(f"⚠️️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
+                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
         quality_choice = "1080p Full HD"
         clip_seconds = 10
@@ -1030,11 +1020,75 @@ with col_main:
             if successful:
                 st.markdown("### **Download Your Sourced Assets**")
 
-                # Master ZIP Archive
+                cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
+
+                if cdn_links:
+                    js_code = """
+                    <script>
+                    async function downloadOneByOne() {
+                        const links = """ + str(cdn_links) + """;
+                        const btn = document.getElementById('seqBtn');
+                        btn.disabled = true;
+                        btn.style.opacity = '0.6';
+
+                        for (let i = 0; i < links.length; i++) {
+                            const item = links[i];
+                            btn.innerText = '⚡ Downloading (' + (i + 1) + '/' + links.length + ')...';
+                            try {
+                                const res = await fetch(item.url);
+                                const blob = await res.blob();
+                                const blobUrl = window.URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.style.display = 'none';
+                                a.href = blobUrl;
+                                a.download = item.name;
+                                document.body.appendChild(a);
+                                a.click();
+                                window.URL.revokeObjectURL(blobUrl);
+                                document.body.removeChild(a);
+                            } catch (err) {
+                                const a = document.createElement('a');
+                                a.href = item.url;
+                                a.download = item.name;
+                                a.target = '_blank';
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                            }
+                            if (i < links.length - 1) {
+                                await new Promise(r => setTimeout(r, 2000));
+                            }
+                        }
+
+                        btn.disabled = false;
+                        btn.style.opacity = '1';
+                        btn.innerText = '✓ All Files Downloaded!';
+                    }
+                    </script>
+                    <div style="padding: 2px 0;">
+                        <button id="seqBtn" onclick="downloadOneByOne()" style="
+                            background: linear-gradient(135deg, #00C853 0%, #009624 100%);
+                            color: white;
+                            border: none;
+                            padding: 13px 20px;
+                            font-size: 15px;
+                            font-weight: 700;
+                            border-radius: 8px;
+                            cursor: pointer;
+                            width: 100%;
+                            margin-bottom: 6px;
+                            box-shadow: 0 4px 6px rgba(0,0,0,0.12);
+                        ">
+                            ⚡ Download One-by-One (2s Gap - Max Regional Speed)
+                        </button>
+                    </div>
+                    """
+                    components.html(js_code, height=65)
+
                 if st.session_state.zip_bytes:
                     zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
                     st.download_button(
-                        label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB Total]**",
+                        label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB]**",
                         data=st.session_state.zip_bytes,
                         file_name="broll_assets.zip",
                         mime="application/zip",
@@ -1043,7 +1097,7 @@ with col_main:
                     )
 
             st.divider()
-            st.markdown("#### **Sourced File Status & Individual 10s Downloads**")
+            st.markdown("#### **Sourced File Status & Previews**")
 
             for r in failed:
                 st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
@@ -1060,20 +1114,6 @@ with col_main:
                     st.markdown(f"**Prompt:** {r['prompt']}")
                     st.markdown(f"**Filename:** `{r['filename']}`")
                     st.caption(f"File Size: {r['detail']}")
-
-                    # Download button for the exact 10s/15s cut created on server
-                    if r.get("file_bytes"):
-                        st.download_button(
-                            label=f"⬇️ **Download {r['filename']}**",
-                            data=r["file_bytes"],
-                            file_name=r["filename"],
-                            mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
-                            key=f"dl_single_{r['filename']}",
-                            type="secondary",
-                            use_container_width=True
-                        )
-
-                    # Optional direct link
                     if r.get("cdn_url"):
-                        st.link_button("🌐 Open Original Stream Link", r["cdn_url"], use_container_width=True)
+                        st.link_button("🌐 Open Source File", r["cdn_url"], use_container_width=True)
                 st.write("---")
