@@ -197,13 +197,13 @@ TOOLS = {
 }
 
 # =====================================================================
-# OFFICIAL YOUTUBE DATA API SEARCH
+# OFFICIAL YOUTUBE SEARCH & RESOLVER
 # =====================================================================
 def search_top3_videos(query: str) -> list[dict]:
     clean_q = query.strip()
     results = []
 
-    # 1. Official YouTube Data API v3
+    # 1. Primary: Official YouTube Data API v3
     if YOUTUBE_API_KEY:
         try:
             yt_url = "https://www.googleapis.com/youtube/v3/search"
@@ -234,7 +234,7 @@ def search_top3_videos(query: str) -> list[dict]:
         except Exception:
             pass
 
-    # 2. Public Invidious Mirrors fallback
+    # 2. Fallback: Public Invidious Mirrors
     try:
         invidious_instances = [
             "https://inv.tux.pizza/api/v1/search",
@@ -267,73 +267,84 @@ def search_top3_videos(query: str) -> list[dict]:
     return results
 
 # =====================================================================
-# CLOUD-HARDENED VIDEO TRIMMER (TIMESTAMPS: START TO END)
+# CLOUD-HARDENED YOUTUBE TRIMMER (TIMESTAMPS: START TO END)
 # =====================================================================
-def trim_youtube_clip(watch_url: str, output_path: str, start_sec: int, end_sec: int) -> tuple[bool, str]:
-    duration = max(1, end_sec - start_sec)
-    
-    # Method 1: yt-dlp Python API with client impersonation and section download
+def get_cloud_direct_stream(video_id: str, watch_url: str) -> str | None:
+    # 1. Query Invidious API for a clean, direct MP4 playback link
+    invidious_hosts = ["https://inv.tux.pizza", "https://invidious.nerdvpn.de", "https://vid.priv.au"]
+    for host in invidious_hosts:
+        try:
+            r = requests.get(f"{host}/api/v1/videos/{video_id}", timeout=6)
+            if r.status_code == 200:
+                fmt_streams = r.json().get("formatStreams", [])
+                for stream in fmt_streams:
+                    u = stream.get("url")
+                    if u and "video/mp4" in stream.get("type", ""):
+                        return u
+        except Exception:
+            continue
+
+    # 2. Query Cobalt Public API
+    try:
+        c_payload = {"url": watch_url, "videoQuality": "720"}
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        r_c = requests.post("https://api.cobalt.tools/api/json", json=c_payload, headers=headers, timeout=8)
+        if r_c.status_code == 200 and r_c.json().get("url"):
+            return r_c.json().get("url")
+    except Exception:
+        pass
+
+    # 3. yt-dlp stream extraction with android client token
     if yt_dlp is not None:
         try:
             ydl_opts = {
                 "format": "best[ext=mp4]/best",
-                "outtmpl": output_path,
-                "overwrites": True,
                 "quiet": True,
-                "no_warnings": True,
-                "download_ranges": yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
-                "force_keyframes_at_cuts": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["android", "ios", "web"]
-                    }
-                }
+                "extractor_args": {"youtube": {"player_client": ["android", "ios"]}}
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([watch_url])
-            
+                info = ydl.extract_info(watch_url, download=False)
+                return info.get("url")
+        except Exception:
+            pass
+
+    return None
+
+
+def trim_youtube_clip(video_id: str, watch_url: str, output_path: str, start_sec: int, end_sec: int) -> tuple[bool, str]:
+    duration = max(1, end_sec - start_sec)
+    
+    # Step A: Resolve direct MP4 stream URL
+    direct_stream = get_cloud_direct_stream(video_id, watch_url)
+    
+    if direct_stream:
+        # Step B: Fast slice with FFmpeg
+        cmd = [
+            FFMPEG_EXE, "-y",
+            "-user_agent", GLOBAL_USER_AGENT,
+            "-ss", str(start_sec),
+            "-i", direct_stream,
+            "-t", str(duration),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "22",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 mb = os.path.getsize(output_path) / (1024 * 1024)
                 return True, f"{mb:.1f} MB ({duration}s slice)"
         except Exception:
             pass
 
-    # Method 2: Direct stream extraction + FFmpeg time seek
-    if yt_dlp is not None:
-        try:
-            ydl_stream_opts = {
-                "format": "best[ext=mp4]/best",
-                "quiet": True,
-                "extractor_args": {"youtube": {"player_client": ["android", "ios"]}}
-            }
-            with yt_dlp.YoutubeDL(ydl_stream_opts) as ydl:
-                info = ydl.extract_info(watch_url, download=False)
-                stream_url = info.get("url")
-                
-            if stream_url:
-                cmd = [
-                    FFMPEG_EXE, "-y",
-                    "-ss", str(start_sec),
-                    "-i", stream_url,
-                    "-t", str(duration),
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-c:a", "aac",
-                    "-movflags", "+faststart",
-                    output_path
-                ]
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-                    mb = os.path.getsize(output_path) / (1024 * 1024)
-                    return True, f"{mb:.1f} MB ({duration}s slice)"
-        except Exception:
-            pass
-
-    # Method 3: Subprocess fallback
+    # Step C: Subprocess fallback via yt-dlp section download
     cmd_cli = [
         "yt-dlp",
         "--force-overwrites",
-        "--extractor-args", "youtube:player_client=android,ios,web",
+        "--extractor-args", "youtube:player_client=android,ios",
         "--download-sections", f"*{start_sec}-{end_sec}",
         "-f", "best[ext=mp4]/best",
         "-o", output_path,
@@ -347,7 +358,7 @@ def trim_youtube_clip(watch_url: str, output_path: str, start_sec: int, end_sec:
     except Exception as e:
         return False, str(e)
 
-    return False, "Could not slice stream. Datacenter block or video is restricted."
+    return False, "Cloud host IP throttled. Please view or grab directly from original link."
 
 # =====================================================================
 # LIVE IMAGE SEARCH HELPERS
@@ -554,28 +565,80 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
         return False, str(e)
 
 
+# =====================================================================
+# TWO-STAGE TRIMMING PIPELINE (SOLVES PEXELS CDN HANGS)
+# =====================================================================
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
-    cmd = [
-        FFMPEG_EXE, "-y",
-        "-user_agent", GLOBAL_USER_AGENT,
-        "-ss", "00:00:00",
-        "-i", cdn_url,
-        "-t", str(duration_sec),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "22",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_path
-    ]
+    temp_raw_file = f"{output_path}.temp_raw.mp4"
+    
+    # Step 1: Download raw file safely to a local temp buffer first
+    download_ok, download_msg = download_stream(cdn_url, temp_raw_file, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+    if not download_ok or not os.path.exists(temp_raw_file):
+        # Fallback to direct network slicing
+        cmd_direct = [
+            FFMPEG_EXE, "-y",
+            "-headers", f"User-Agent: {GLOBAL_USER_AGENT}\r\n",
+            "-ss", "00:00:00",
+            "-i", cdn_url,
+            "-t", str(duration_sec),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        try:
+            subprocess.run(cmd_direct, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                sz_mb = os.path.getsize(output_path) / (1024 * 1024)
+                return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
+        except Exception:
+            pass
+        return False, f"Download failed: {download_msg}"
+
+    # Step 2: Slice the local temporary file instantly with FFmpeg
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        cmd_fast = [
+            FFMPEG_EXE, "-y",
+            "-ss", "00:00:00",
+            "-i", temp_raw_file,
+            "-t", str(duration_sec),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        subprocess.run(cmd_fast, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        
+        # Fallback re-encode if keyframe copy fails
+        if not (os.path.exists(output_path) and os.path.getsize(output_path) > 1000):
+            cmd_reencode = [
+                FFMPEG_EXE, "-y",
+                "-ss", "00:00:00",
+                "-i", temp_raw_file,
+                "-t", str(duration_sec),
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "22",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                output_path
+            ]
+            subprocess.run(cmd_reencode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             sz_mb = os.path.getsize(output_path) / (1024 * 1024)
             return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
-    except Exception:
-        pass
+            
+    except Exception as e:
+        return False, f"Slicing error: {e}"
+        
+    finally:
+        if os.path.exists(temp_raw_file):
+            try:
+                os.remove(temp_raw_file)
+            except Exception:
+                pass
 
     return False, "Could not slice video."
 
@@ -782,13 +845,13 @@ def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int 
     ia_url = "https://archive.org/advancedsearch.php"
     params = {"q": f"({query}) AND collection:(fedflix)", "fl[]": "identifier", "rows": 4, "output": "json"}
     try:
-        r = requests.get(ia_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=12)
+        r = requests.get(ia_url, params=params, headers=headers, timeout=12)
         if r.status_code == 200:
             docs = r.json().get("response", {}).get("docs", [])
             for doc in docs:
                 ident = doc.get("identifier")
                 if ident:
-                    m_res = requests.get(f"https://archive.org/metadata/{ident}/files", headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
+                    m_res = requests.get(f"https://archive.org/metadata/{ident}/files", headers=headers, timeout=10)
                     if m_res.status_code == 200:
                         files = m_res.json().get("result", [])
                         mp4s = [f for f in files if f.get("name", "").lower().endswith(".mp4")]
@@ -913,17 +976,10 @@ st.markdown("""
     h3, h4 {
         font-weight: 700 !important;
     }
-    .video-card {
-        background-color: #ffffff;
-        border: 1px solid #e1e4e8;
-        border-radius: 10px;
-        padding: 20px;
-        margin-bottom: 25px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# Security login
+# Security Login Gatekeeper
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -950,7 +1006,7 @@ if not st.session_state.authenticated:
                     st.error("Incorrect Username or Password. Access Denied.")
     st.stop()
 
-# Session caches
+# Session State Caches
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "zip_bytes" not in st.session_state:
@@ -1024,7 +1080,7 @@ with col_main:
         st.caption("Search real town names, landmarks, and city reels. Videos are listed vertically with custom start & end timestamp trimming controls.")
 
         if not YOUTUBE_API_KEY:
-            st.warning("⚠️️ Add `YOUTUBE_API_KEY` (or `GOOGLE_API_KEY`) to your Streamlit Secrets for full YouTube Data API quota.")
+            st.warning("⚠️ Add `YOUTUBE_API_KEY` (or `GOOGLE_API_KEY`) to your Streamlit Secrets for full YouTube Data API quota.")
 
         col_vbar, col_vgo = st.columns([3, 1])
         with col_vbar:
@@ -1095,12 +1151,12 @@ with col_main:
 
                     if st.button(f"✂️ Trim Clip ({duration}s)", key=f"btn_trim_v_{idx}", type="primary", use_container_width=True, disabled=(start_time >= end_time)):
                         with st.spinner(f"Slicing clip from {start_time}s to {end_time}s..."):
-                            ok, msg = trim_youtube_clip(item["watch_url"], trimmed_out, start_time, end_time)
+                            ok, msg = trim_youtube_clip(item.get("video_id", ""), item["watch_url"], trimmed_out, start_time, end_time)
                             if ok and os.path.exists(trimmed_out):
                                 st.session_state[f"sliced_{idx}"] = trimmed_out
                                 st.success(f"✓ Trimmed successfully! ({msg})")
                             else:
-                                st.error("Trimming failed. Use the full video link below:")
+                                st.error(f"Trimming error: {msg}")
 
                     if st.session_state.get(f"sliced_{idx}") and os.path.exists(st.session_state[f"sliced_{idx}"]):
                         with open(st.session_state[f"sliced_{idx}"], "rb") as vf:
@@ -1271,7 +1327,7 @@ with col_main:
         if auth_key_name:
             current_key = globals().get(auth_key_name, "")
             if not current_key:
-                st.warning(f"⚠️️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
+                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
         quality_choice = "1080p Full HD"
         clip_seconds = 10
@@ -1394,7 +1450,7 @@ with col_main:
 
                     if r.get("file_bytes"):
                         st.download_button(
-                            label=f"⬇ **Download {r['filename']}**",
+                            label=f"⬇️ **Download {r['filename']}**",
                             data=r["file_bytes"],
                             file_name=r["filename"],
                             mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
