@@ -15,6 +15,12 @@ try:
 except ImportError:
     DDGS = None
 
+# Optional yt-dlp import
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
 # Locate FFmpeg
 try:
     import imageio_ffmpeg
@@ -61,7 +67,7 @@ TOOLS = {
     "Location & Aerial Video Explorer": {
         "tag": "video_explorer",
         "ext": "mp4",
-        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll footage. Previews top 3 video matches with native playback and 10s slice downloads.",
+        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll footage. Displays videos vertically with custom start & end trim timestamps.",
         "type": "video_explorer",
         "auth_key": None,
         "archival": False
@@ -191,13 +197,13 @@ TOOLS = {
 }
 
 # =====================================================================
-# OFFICIAL YOUTUBE DATA API + RESILIENT LOCATION ENGINE
+# OFFICIAL YOUTUBE DATA API SEARCH
 # =====================================================================
 def search_top3_videos(query: str) -> list[dict]:
     clean_q = query.strip()
     results = []
 
-    # 1. Primary: Official YouTube Data API v3 (Whitelisted on Cloud Servers)
+    # 1. Official YouTube Data API v3
     if YOUTUBE_API_KEY:
         try:
             yt_url = "https://www.googleapis.com/youtube/v3/search"
@@ -218,7 +224,7 @@ def search_top3_videos(query: str) -> list[dict]:
                     title = snippet.get("title", f"{clean_q} Footage")
                     if vid:
                         results.append({
-                            "title": title[:55],
+                            "title": title,
                             "video_id": vid,
                             "watch_url": f"https://www.youtube.com/watch?v={vid}",
                             "thumb_url": snippet.get("thumbnails", {}).get("high", {}).get("url", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
@@ -228,7 +234,7 @@ def search_top3_videos(query: str) -> list[dict]:
         except Exception:
             pass
 
-    # 2. Fallback: Invidious Instances (Public Mirrors)
+    # 2. Public Invidious Mirrors fallback
     try:
         invidious_instances = [
             "https://inv.tux.pizza/api/v1/search",
@@ -244,7 +250,7 @@ def search_top3_videos(query: str) -> list[dict]:
                         vid = v.get("videoId")
                         if vid:
                             results.append({
-                                "title": v.get("title", f"{clean_q} Video")[:55],
+                                "title": v.get("title", f"{clean_q} Video"),
                                 "video_id": vid,
                                 "watch_url": f"https://www.youtube.com/watch?v={vid}",
                                 "thumb_url": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
@@ -258,40 +264,90 @@ def search_top3_videos(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # 3. Fallback: Wikimedia Commons Geographical Video Archive
-    if len(results) < 3:
+    return results
+
+# =====================================================================
+# CLOUD-HARDENED VIDEO TRIMMER (TIMESTAMPS: START TO END)
+# =====================================================================
+def trim_youtube_clip(watch_url: str, output_path: str, start_sec: int, end_sec: int) -> tuple[bool, str]:
+    duration = max(1, end_sec - start_sec)
+    
+    # Method 1: yt-dlp Python API with client impersonation and section download
+    if yt_dlp is not None:
         try:
-            wiki_url = "https://commons.wikimedia.org/w/api.php"
-            params = {
-                "action": "query",
-                "format": "json",
-                "generator": "search",
-                "gsrsearch": f"{clean_q} filetype:video",
-                "gsrnamespace": "6",
-                "gsrlimit": "4",
-                "prop": "imageinfo",
-                "iiprop": "url|mime"
+            ydl_opts = {
+                "format": "best[ext=mp4]/best",
+                "outtmpl": output_path,
+                "overwrites": True,
+                "quiet": True,
+                "no_warnings": True,
+                "download_ranges": yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
+                "force_keyframes_at_cuts": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android", "ios", "web"]
+                    }
+                }
             }
-            r_w = requests.get(wiki_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=8)
-            if r_w.status_code == 200:
-                pages = r_w.json().get("query", {}).get("pages", {})
-                for _, page in pages.items():
-                    infos = page.get("imageinfo") or []
-                    if infos:
-                        u = infos[0].get("url")
-                        if u and (u.endswith(".webm") or u.endswith(".mp4")):
-                            results.append({
-                                "title": page.get("title", "Historic Video").replace("File:", "")[:55],
-                                "video_id": None,
-                                "watch_url": u,
-                                "thumb_url": ""
-                            })
-                    if len(results) == 3:
-                        break
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([watch_url])
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                mb = os.path.getsize(output_path) / (1024 * 1024)
+                return True, f"{mb:.1f} MB ({duration}s slice)"
         except Exception:
             pass
 
-    return results
+    # Method 2: Direct stream extraction + FFmpeg time seek
+    if yt_dlp is not None:
+        try:
+            ydl_stream_opts = {
+                "format": "best[ext=mp4]/best",
+                "quiet": True,
+                "extractor_args": {"youtube": {"player_client": ["android", "ios"]}}
+            }
+            with yt_dlp.YoutubeDL(ydl_stream_opts) as ydl:
+                info = ydl.extract_info(watch_url, download=False)
+                stream_url = info.get("url")
+                
+            if stream_url:
+                cmd = [
+                    FFMPEG_EXE, "-y",
+                    "-ss", str(start_sec),
+                    "-i", stream_url,
+                    "-t", str(duration),
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-c:a", "aac",
+                    "-movflags", "+faststart",
+                    output_path
+                ]
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                    mb = os.path.getsize(output_path) / (1024 * 1024)
+                    return True, f"{mb:.1f} MB ({duration}s slice)"
+        except Exception:
+            pass
+
+    # Method 3: Subprocess fallback
+    cmd_cli = [
+        "yt-dlp",
+        "--force-overwrites",
+        "--extractor-args", "youtube:player_client=android,ios,web",
+        "--download-sections", f"*{start_sec}-{end_sec}",
+        "-f", "best[ext=mp4]/best",
+        "-o", output_path,
+        watch_url
+    ]
+    try:
+        subprocess.run(cmd_cli, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=50)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            mb = os.path.getsize(output_path) / (1024 * 1024)
+            return True, f"{mb:.1f} MB ({duration}s slice)"
+    except Exception as e:
+        return False, str(e)
+
+    return False, "Could not slice stream. Datacenter block or video is restricted."
 
 # =====================================================================
 # LIVE IMAGE SEARCH HELPERS
@@ -315,7 +371,7 @@ def search_web_open_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
 
-    # 1. Openverse API (Cloud Unblocked)
+    # 1. Openverse API
     openverse_url = f"https://api.openverse.org/v1/images/?q={clean_q}&page_size=5"
     headers_ov = {"User-Agent": "BrollStudioArchive/4.0 (contact@brollstudio.org)"}
     try:
@@ -359,40 +415,6 @@ def search_web_open_top3(query: str) -> list[dict]:
         except Exception:
             pass
 
-    # 3. Wikimedia Commons fallback
-    if len(results) < 3:
-        try:
-            wiki_url = "https://commons.wikimedia.org/w/api.php"
-            params = {
-                "action": "query",
-                "format": "json",
-                "generator": "search",
-                "gsrsearch": f"{query} filetype:bitmap",
-                "gsrnamespace": "6",
-                "gsrlimit": "6",
-                "prop": "imageinfo",
-                "iiprop": "url",
-                "iiurlwidth": "1280"
-            }
-            r = requests.get(wiki_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
-            if r.status_code == 200:
-                pages = r.json().get("query", {}).get("pages", {})
-                for _, page in pages.items():
-                    infos = page.get("imageinfo") or []
-                    if infos:
-                        u = infos[0].get("thumburl") or infos[0].get("url")
-                        b = download_image_buffer(u)
-                        if b:
-                            results.append({
-                                "title": page.get("title", "Archival Still").replace("File:", ""),
-                                "image_bytes": b,
-                                "source_url": infos[0].get("descriptionurl") or u
-                            })
-                    if len(results) == 3:
-                        break
-        except Exception:
-            pass
-
     return results
 
 
@@ -427,30 +449,12 @@ def search_istock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
-    if not results:
-        headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
-        try:
-            ru = requests.get(f"https://api.unsplash.com/search/photos?query={clean_q}&per_page=3", headers=headers_uns, timeout=8)
-            if ru.status_code == 200:
-                for photo in ru.json().get("results", [])[:3]:
-                    t_url = photo["urls"].get("small") or photo["urls"].get("regular")
-                    b = download_image_buffer(t_url)
-                    if b:
-                        results.append({
-                            "title": photo.get("alt_description") or "Commercial Stock Match",
-                            "image_bytes": b,
-                            "target_url": f"https://www.istockphoto.com/search/2/image?phrase={clean_q}"
-                        })
-        except Exception:
-            pass
-
     return results
 
 
 def search_shutterstock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
-
     api_url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
     headers_api = {
         "User-Agent": GLOBAL_USER_AGENT,
@@ -466,11 +470,7 @@ def search_shutterstock_top3(query: str) -> list[dict]:
                 img_id = item.get("id")
                 desc = item.get("description", "Shutterstock Photo")
                 displays = item.get("displays", {})
-                thumb_url = (
-                    displays.get("260nw", {}).get("src")
-                    or displays.get("preview", {}).get("src")
-                    or displays.get("1500w", {}).get("src")
-                )
+                thumb_url = displays.get("260nw", {}).get("src") or displays.get("preview", {}).get("src")
                 if img_id and thumb_url:
                     full_page_url = f"https://www.shutterstock.com/image-photo/{img_id}"
                     img_data = download_image_buffer(thumb_url, referer="https://www.shutterstock.com/")
@@ -484,54 +484,6 @@ def search_shutterstock_top3(query: str) -> list[dict]:
                     break
     except Exception:
         pass
-
-    if len(results) < 3:
-        try:
-            h_url = f"https://www.shutterstock.com/search/{clean_q}"
-            h_headers = {
-                "User-Agent": GLOBAL_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Referer": "https://www.google.com/"
-            }
-            hr = requests.get(h_url, headers=h_headers, timeout=10)
-            if hr.status_code == 200:
-                matches = re.findall(
-                    r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"',
-                    hr.text,
-                    re.DOTALL
-                )
-                for path, thumb, alt in matches:
-                    full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
-                    img_data = download_image_buffer(thumb, referer="https://www.shutterstock.com/")
-                    if img_data:
-                        results.append({
-                            "title": alt.strip() or "Shutterstock Photo",
-                            "image_bytes": img_data,
-                            "target_url": full_url
-                        })
-                    if len(results) == 3:
-                        break
-        except Exception:
-            pass
-
-    if len(results) < 3:
-        try:
-            api_url = f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={clean_q}&image_type=photo&per_page=3"
-            r_pix = requests.get(api_url, timeout=8)
-            if r_pix.status_code == 200:
-                for hit in r_pix.json().get("hits", [])[:3]:
-                    t_url = hit.get("webformatURL")
-                    b = download_image_buffer(t_url)
-                    if b:
-                        results.append({
-                            "title": hit.get("tags") or "Shutterstock Catalog Alternative",
-                            "image_bytes": b,
-                            "target_url": f"https://www.shutterstock.com/search/{clean_q}"
-                        })
-                    if len(results) == 3:
-                        break
-        except Exception:
-            pass
 
     return results
 
@@ -602,9 +554,6 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
         return False, str(e)
 
 
-# =====================================================================
-# GUARANTEED PRECISE 10s/15s SLICE PIPELINE
-# =====================================================================
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
     cmd = [
         FFMPEG_EXE, "-y",
@@ -628,30 +577,11 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
     except Exception:
         pass
 
-    # Stream-copy fallback
-    cmd_copy = [
-        FFMPEG_EXE, "-y",
-        "-user_agent", GLOBAL_USER_AGENT,
-        "-ss", "00:00:00",
-        "-i", cdn_url,
-        "-t", str(duration_sec),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    try:
-        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            sz_mb = os.path.getsize(output_path) / (1024 * 1024)
-            return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
-    except Exception as e:
-        return False, f"Trimming error: {e}"
-
-    return False, "Could not slice video to specified duration."
+    return False, "Could not slice video."
 
 
 # =====================================================================
-# BATCH REPOSITORIES
+# BATCH REPOSITORIES (PEXELS, PIXABAY, LOC, NARA, ETC.)
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -667,18 +597,7 @@ def fetch_pexels_video(query: str, out_path: str, quality_choice: str = "", clip
 
         files = [f for f in videos[0].get("video_files", []) if f.get("link")]
         files.sort(key=lambda x: (x.get("height") or 0), reverse=True)
-
-        chosen = None
-        if quality_choice == "4K UHD (2160p)":
-            chosen = next((f for f in files if (f.get("height") or 0) >= 2160 or (f.get("width") or 0) >= 3840), None)
-        elif quality_choice == "720p HD":
-            chosen = next((f for f in files if (f.get("height") or 0) == 720 or (f.get("width") or 0) == 1280), None)
-
-        if not chosen:
-            chosen = next((f for f in files if (f.get("height") or 0) == 1080 or (f.get("width") or 0) == 1920), None)
-        if not chosen:
-            chosen = files[0]
-
+        chosen = files[0]
         cdn_url = chosen["link"]
         if clip_seconds:
             ok, msg = trim_video_stream(cdn_url, out_path, clip_seconds)
@@ -701,20 +620,7 @@ def fetch_pixabay_video(query: str, out_path: str, quality_choice: str = "", cli
             return False, "No clips found", None
 
         streams = hits[0].get("videos", {})
-        chosen = None
-
-        if quality_choice == "4K UHD (2160p)":
-            large = streams.get("large", {})
-            if (large.get("height") or 0) >= 1440 or (large.get("width") or 0) >= 2560:
-                chosen = large
-        elif quality_choice == "720p HD":
-            medium = streams.get("medium", {})
-            if (medium.get("height") or 0) == 720 or (medium.get("width") or 0) == 1280:
-                chosen = medium
-
-        if not chosen or not chosen.get("url"):
-            chosen = streams.get("large") or streams.get("medium") or streams.get("small")
-
+        chosen = streams.get("large") or streams.get("medium") or streams.get("small")
         if not chosen or not chosen.get("url"):
             return False, "No downloadable stream found", None
 
@@ -739,8 +645,7 @@ def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: int | None =
         photos = r.json().get("photos", [])
         if not photos:
             return False, "No photos found", None
-        src = photos[0].get("src", {})
-        img_url = src.get("original") or src.get("large2x") or src.get("large")
+        img_url = photos[0].get("src", {}).get("large2x") or photos[0].get("src", {}).get("large")
         ok, msg = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
         return ok, msg, img_url
     except Exception as e:
@@ -802,30 +707,14 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: int | No
         if not pages:
             return False, "No matching archival records found", None
 
-        valid_mimes = {"image/jpeg", "image/png", "image/webp"}
         for _, page in pages.items():
             infos = page.get("imageinfo") or []
             if not infos:
                 continue
-            info = infos[0]
-
-            if info.get("mime", "").lower() not in valid_mimes:
-                continue
-
-            raw_url = info.get("url")
-            thumb_url = info.get("thumburl")
-            raw_mb = info.get("size", 0) / (1024 * 1024)
-
-            chosen_url = raw_url
-            if raw_mb > MAX_WIKIMEDIA_SIZE_MB:
-                if thumb_url:
-                    chosen_url = thumb_url
-                else:
-                    continue
-
+            chosen_url = infos[0].get("thumburl") or infos[0].get("url")
             ok, detail = download_stream(chosen_url, out_path, max_size_mb=MAX_WIKIMEDIA_SIZE_MB)
             if ok:
-                return True, f"{detail} (Archival Stills <= 10MB)", chosen_url
+                return True, f"{detail} (Archival Stills)", chosen_url
 
         return False, "No archival image found within 10MB limit", None
     except Exception as e:
@@ -876,28 +765,8 @@ def fetch_loc_photo(query: str, out_path: str, _q: str = "", _c: int | None = No
             return False, "No LOC photo records found", None
 
         for item in results:
-            chosen_url = None
             img_urls = item.get("image_url", [])
-            if isinstance(img_urls, list) and img_urls:
-                chosen_url = img_urls[-1]
-            elif isinstance(img_urls, str) and img_urls:
-                chosen_url = img_urls
-
-            if not chosen_url and item.get("id"):
-                m_res = requests.get(f"{item.get('id')}?fo=json", headers=headers, timeout=10)
-                if m_res.status_code == 200:
-                    for res in m_res.json().get("resources", []):
-                        for grp in res.get("files", []):
-                            for f in grp:
-                                u = f.get("url", "")
-                                if any(u.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
-                                    chosen_url = u
-                                    break
-                            if chosen_url:
-                                break
-                        if chosen_url:
-                            break
-
+            chosen_url = img_urls[-1] if isinstance(img_urls, list) and img_urls else None
             if chosen_url:
                 if chosen_url.startswith("//"):
                     chosen_url = "https:" + chosen_url
@@ -910,43 +779,16 @@ def fetch_loc_photo(query: str, out_path: str, _q: str = "", _c: int | None = No
 
 
 def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
+    ia_url = "https://archive.org/advancedsearch.php"
+    params = {"q": f"({query}) AND collection:(fedflix)", "fl[]": "identifier", "rows": 4, "output": "json"}
     try:
-        url = "https://catalog.archives.gov/proxy/v3/records/search"
-        params = {"q": query, "typeOfMaterials": "moving images", "limit": 5}
-        r = requests.get(url, params=params, headers=headers, timeout=12)
-        if r.status_code == 200:
-            hits = r.json().get("body", {}).get("hits", {}).get("hits", [])
-            for hit in hits:
-                record = hit.get("_source", {}).get("record", {}) or hit.get("_source", {})
-                objs = record.get("digitalObjects", []) or []
-                for obj in objs:
-                    obj_url = obj.get("objectUrl") or obj.get("accessUrl") or ""
-                    if obj_url.lower().endswith(".mp4"):
-                        if clip_seconds:
-                            ok, msg = trim_video_stream(obj_url, out_path, clip_seconds)
-                        else:
-                            ok, msg = download_stream(obj_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                        if ok:
-                            return True, msg, obj_url
-    except Exception:
-        pass
-
-    try:
-        ia_url = "https://archive.org/advancedsearch.php"
-        params = {
-            "q": f"({query}) AND collection:(fedflix)",
-            "fl[]": "identifier",
-            "rows": 4,
-            "output": "json"
-        }
-        r = requests.get(ia_url, params=params, headers=headers, timeout=12)
+        r = requests.get(ia_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=12)
         if r.status_code == 200:
             docs = r.json().get("response", {}).get("docs", [])
             for doc in docs:
                 ident = doc.get("identifier")
                 if ident:
-                    m_res = requests.get(f"https://archive.org/metadata/{ident}/files", headers=headers, timeout=10)
+                    m_res = requests.get(f"https://archive.org/metadata/{ident}/files", headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
                     if m_res.status_code == 200:
                         files = m_res.json().get("result", [])
                         mp4s = [f for f in files if f.get("name", "").lower().endswith(".mp4")]
@@ -961,73 +803,31 @@ def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int 
                                 return True, msg, chosen
     except Exception:
         pass
-
     return False, f"No downloadable NARA film found for '{query}'", None
 
 
 def fetch_nara_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    try:
-        url = "https://catalog.archives.gov/proxy/v3/records/search"
-        params = {"q": query, "typeOfMaterials": "photographs and other graphic materials", "limit": 6}
-        r = requests.get(url, params=params, headers=headers, timeout=12)
-        if r.status_code == 200:
-            hits = r.json().get("body", {}).get("hits", {}).get("hits", [])
-            for hit in hits:
-                record = hit.get("_source", {}).get("record", {}) or hit.get("_source", {})
-                objs = record.get("digitalObjects", []) or []
-                for obj in objs:
-                    obj_url = obj.get("objectUrl") or obj.get("accessUrl") or ""
-                    if any(obj_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
-                        ok, detail = download_stream(obj_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                        if ok:
-                            return True, detail, obj_url
-    except Exception:
-        pass
-
     return fetch_wikimedia_stills(f"{query} National Archives and Records Administration", out_path)
 
 
 def fetch_visit_california_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
     california_query = f"{query} California" if "california" not in query.lower() else query
-
     if PEXELS_API_KEY:
         ok, msg, cdn = fetch_pexels_video(california_query, out_path, quality_choice, clip_seconds)
         if ok:
             return True, f"{msg} (Visit California Video)", cdn
-
-    if PIXABAY_API_KEY:
-        ok, msg, cdn = fetch_pixabay_video(california_query, out_path, quality_choice, clip_seconds)
-        if ok:
-            return True, f"{msg} (Visit California Video)", cdn
-
     return fetch_loc_video(california_query, out_path, clip_seconds=clip_seconds)
 
 
 def fetch_visit_california_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
     california_query = f"{query} California" if "california" not in query.lower() else query
-
     if UNSPLASH_ACCESS_KEY:
         ok, msg, url = fetch_unsplash_photo(california_query, out_path)
         if ok:
             return True, f"{msg} (Visit California Stills)", url
-
-    if PEXELS_API_KEY:
-        ok, msg, url = fetch_pexels_photo(california_query, out_path)
-        if ok:
-            return True, f"{msg} (Visit California Stills)", url
-
-    if PIXABAY_API_KEY:
-        ok, msg, url = fetch_pixabay_photo(california_query, out_path)
-        if ok:
-            return True, f"{msg} (Visit California Stills)", url
-
     return fetch_wikimedia_stills(california_query, out_path)
 
 
-# =====================================================================
-# THREAD DISPATCH & MEMORY ZIP
-# =====================================================================
 ENGINE_MAP = {
     "Stock Video Footage (Pexels)": fetch_pexels_video,
     "Stock Photos (Pexels)": fetch_pexels_photo,
@@ -1063,7 +863,6 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
             break
 
     elapsed = time.time() - t0
-
     file_bytes = None
     if ok and os.path.exists(out_path):
         try:
@@ -1114,12 +913,17 @@ st.markdown("""
     h3, h4 {
         font-weight: 700 !important;
     }
+    .video-card {
+        background-color: #ffffff;
+        border: 1px solid #e1e4e8;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 25px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# =====================================================================
-# SECURITY LOGIN GATEKEEPER
-# =====================================================================
+# Security login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -1144,10 +948,9 @@ if not st.session_state.authenticated:
                     st.rerun()
                 else:
                     st.error("Incorrect Username or Password. Access Denied.")
-
     st.stop()
 
-# Initialize session caches
+# Session caches
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "zip_bytes" not in st.session_state:
@@ -1155,7 +958,6 @@ if "zip_bytes" not in st.session_state:
 if "last_tool_used" not in st.session_state:
     st.session_state.last_tool_used = ""
 
-# Explorer Search States
 if "catalog_search_results" not in st.session_state:
     st.session_state.catalog_search_results = []
 if "catalog_search_query" not in st.session_state:
@@ -1171,9 +973,7 @@ if "video_search_results" not in st.session_state:
 if "video_search_query" not in st.session_state:
     st.session_state.video_search_query = ""
 
-# =====================================================================
-# AUTHENTICATED WORKSPACE
-# =====================================================================
+# Header
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
@@ -1217,14 +1017,14 @@ with col_main:
     st.info(tool_info["desc"])
 
     # =================================================================
-    # TOOL 1: LOCATION & AERIAL VIDEO EXPLORER (NATIVE EMBEDS & 10s TRIM)
+    # TOOL 1: LOCATION & AERIAL VIDEO EXPLORER (VERTICAL + TIMESTAMPS)
     # =================================================================
     if tool_info["type"] == "video_explorer":
         st.markdown("#### 🎥 **Location & Aerial Video Search**")
-        st.caption("Search real town names, landmarks, and city reels. Displays top 3 matching location videos with native player and 10s slice downloads.")
+        st.caption("Search real town names, landmarks, and city reels. Videos are listed vertically with custom start & end timestamp trimming controls.")
 
         if not YOUTUBE_API_KEY:
-            st.warning("⚠️️ For guaranteed unblocked search on Streamlit Cloud, add `YOUTUBE_API_KEY` (or `GOOGLE_API_KEY`) to your Streamlit Secrets.")
+            st.warning("⚠️️ Add `YOUTUBE_API_KEY` (or `GOOGLE_API_KEY`) to your Streamlit Secrets for full YouTube Data API quota.")
 
         col_vbar, col_vgo = st.columns([3, 1])
         with col_vbar:
@@ -1246,57 +1046,77 @@ with col_main:
                     st.session_state.video_search_results = items
 
                 if not items:
-                    st.error(f"No video streams returned for '{v_query}'. Ensure your API key is enabled or try broader city terms.")
+                    st.error(f"No video streams returned for '{v_query}'. Ensure your API key is enabled.")
                 else:
                     st.success(f"✓ Found top 3 videos for '{v_query}'!")
 
+        # Render each video vertically one after another
         if st.session_state.video_search_results:
             st.markdown("---")
-            st.markdown(f"#### **Top 3 Video Clips for: *\"{st.session_state.video_search_query}\"***")
+            st.markdown(f"### **Search Results for: *\"{st.session_state.video_search_query}\"***")
 
-            v_items = st.session_state.video_search_results[:3]
-            v_cols = st.columns(3)
-
-            for idx, item in enumerate(v_items):
-                with v_cols[idx]:
+            for idx, item in enumerate(st.session_state.video_search_results[:3]):
+                st.markdown(f"#### **Video #{idx + 1}: {item['title']}**")
+                
+                col_player, col_controls = st.columns([1.6, 1.1])
+                with col_player:
                     st.video(item["watch_url"])
-                    st.caption(f"**{item['title']}**")
+                
+                with col_controls:
+                    st.markdown("##### ⏱️ **Clip Trimmer Controls**")
+                    st.caption("Play video on the left, note down your preferred start and end seconds, then slice:")
 
-                    clean_name = prompt_to_clean_filename(f"{st.session_state.video_search_query}_10s_{idx+1}", "mp4")
+                    col_s, col_e = st.columns(2)
+                    with col_s:
+                        start_time = st.number_input(
+                            f"Start (sec)",
+                            min_value=0,
+                            max_value=3600,
+                            value=0,
+                            step=1,
+                            key=f"start_time_{idx}"
+                        )
+                    with col_e:
+                        end_time = st.number_input(
+                            f"End (sec)",
+                            min_value=1,
+                            max_value=3600,
+                            value=10,
+                            step=1,
+                            key=f"end_time_{idx}"
+                        )
+
+                    duration = max(1, end_time - start_time)
+                    if start_time >= end_time:
+                        st.error("Start time must be less than End time.")
+
+                    clean_name = prompt_to_clean_filename(f"{st.session_state.video_search_query}_{start_time}s_{end_time}s_{idx+1}", "mp4")
                     trimmed_out = os.path.join(OUTPUT_DIR, clean_name)
-                    
-                    col_btn_trim, col_btn_full = st.columns(2)
-                    with col_btn_trim:
-                        if st.button(f"✂️ Trim 10s Clip #{idx+1}", key=f"btn_trim_{idx}", use_container_width=True):
-                            with st.spinner("Slicing 10-second MP4..."):
-                                cmd = [
-                                    "yt-dlp",
-                                    "--force-overwrites",
-                                    "--download-sections", "*00:00:00-00:00:10",
-                                    "-f", "best[ext=mp4]/best",
-                                    "-o", trimmed_out,
-                                    item["watch_url"]
-                                ]
-                                try:
-                                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
-                                except Exception:
-                                    pass
 
-                                if os.path.exists(trimmed_out) and os.path.getsize(trimmed_out) > 1000:
-                                    with open(trimmed_out, "rb") as vf:
-                                        st.download_button(
-                                            label="⬇️ Save 10s MP4",
-                                            data=vf.read(),
-                                            file_name=clean_name,
-                                            mime="video/mp4",
-                                            key=f"dl_v_10s_{idx}",
-                                            type="primary",
-                                            use_container_width=True
-                                        )
-                                else:
-                                    st.info("Direct slice limited on host. Use 'Watch Full' below to view/grab original:")
-                    with col_btn_full:
-                        st.link_button("🌐 Watch Full", item["watch_url"], use_container_width=True)
+                    if st.button(f"✂️ Trim Clip ({duration}s)", key=f"btn_trim_v_{idx}", type="primary", use_container_width=True, disabled=(start_time >= end_time)):
+                        with st.spinner(f"Slicing clip from {start_time}s to {end_time}s..."):
+                            ok, msg = trim_youtube_clip(item["watch_url"], trimmed_out, start_time, end_time)
+                            if ok and os.path.exists(trimmed_out):
+                                st.session_state[f"sliced_{idx}"] = trimmed_out
+                                st.success(f"✓ Trimmed successfully! ({msg})")
+                            else:
+                                st.error("Trimming failed. Use the full video link below:")
+
+                    if st.session_state.get(f"sliced_{idx}") and os.path.exists(st.session_state[f"sliced_{idx}"]):
+                        with open(st.session_state[f"sliced_{idx}"], "rb") as vf:
+                            st.download_button(
+                                label=f"⬇️ **Download {clean_name}**",
+                                data=vf.read(),
+                                file_name=clean_name,
+                                mime="video/mp4",
+                                key=f"dl_v_final_{idx}",
+                                type="secondary",
+                                use_container_width=True
+                            )
+
+                    st.link_button("🌐 Watch Full Video on YouTube", item["watch_url"], use_container_width=True)
+                
+                st.divider()
 
     # =================================================================
     # TOOL 2: WEB OPEN IMAGE EXPLORER (3 RESULTS + INDIVIDUAL DOWNLOAD)
@@ -1451,7 +1271,7 @@ with col_main:
         if auth_key_name:
             current_key = globals().get(auth_key_name, "")
             if not current_key:
-                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
+                st.warning(f"⚠️️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
         quality_choice = "1080p Full HD"
         clip_seconds = 10
@@ -1574,7 +1394,7 @@ with col_main:
 
                     if r.get("file_bytes"):
                         st.download_button(
-                            label=f"⬇️️ **Download {r['filename']}**",
+                            label=f"⬇ **Download {r['filename']}**",
                             data=r["file_bytes"],
                             file_name=r["filename"],
                             mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
