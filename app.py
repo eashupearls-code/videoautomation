@@ -15,6 +15,12 @@ try:
 except ImportError:
     DDGS = None
 
+# Optional yt-dlp import
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
 # Locate FFmpeg
 try:
     import imageio_ffmpeg
@@ -57,6 +63,14 @@ ARCHIVAL_MODIFIERS = {
 # REPOSITORIES & TOOLS
 # =====================================================================
 TOOLS = {
+    "Location & Aerial Video Explorer (yt-dlp)": {
+        "tag": "video_explorer",
+        "ext": "mp4",
+        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll (e.g. Shreveport Louisiana, Big Sur drone). Previews top 3 video streams with 10s slice downloads.",
+        "type": "video_explorer",
+        "auth_key": None,
+        "archival": False
+    },
     "Web Open Image Search (Openverse & Web)": {
         "tag": "web_photo_search",
         "ext": "jpg",
@@ -182,7 +196,106 @@ TOOLS = {
 }
 
 # =====================================================================
-# LIVE CATALOG SEARCH HELPERS
+# LOCATION-ACCURATE MULTI-TIER VIDEO ENGINE (YT-DLP / WIKI / STOCK)
+# =====================================================================
+def search_top3_videos(query: str) -> list[dict]:
+    clean_q = query.strip()
+    results = []
+
+    # TIER 1: Geo-Specific Drone & B-Roll Extraction via yt-dlp
+    if yt_dlp is not None:
+        ydl_opts = {
+            "format": "best[ext=mp4]/best",
+            "extract_flat": "in_playlist",
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        try:
+            search_query = f"ytsearch4:{clean_q} drone b-roll 4k"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+                entries = info.get("entries", [])
+                for entry in entries:
+                    v_id = entry.get("id")
+                    v_url = entry.get("url") or f"https://www.youtube.com/watch?v={v_id}"
+                    title = entry.get("title", f"{clean_q} Footage")
+
+                    try:
+                        with yt_dlp.YoutubeDL({"format": "18/best[ext=mp4]/best", "quiet": True}) as ydl_stream:
+                            sub_info = ydl_stream.extract_info(v_url, download=False)
+                            stream_direct_url = sub_info.get("url")
+                            if stream_direct_url:
+                                results.append({
+                                    "title": title[:55],
+                                    "stream_url": stream_direct_url,
+                                    "page_url": v_url
+                                })
+                    except Exception:
+                        continue
+
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    # TIER 2: Wikimedia Commons Geographic Video Category
+    if len(results) < 3:
+        try:
+            wiki_url = "https://commons.wikimedia.org/w/api.php"
+            params = {
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": f"{clean_q} filetype:video",
+                "gsrnamespace": "6",
+                "gsrlimit": "6",
+                "prop": "imageinfo",
+                "iiprop": "url|mime"
+            }
+            r = requests.get(wiki_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
+            if r.status_code == 200:
+                pages = r.json().get("query", {}).get("pages", {})
+                for _, page in pages.items():
+                    infos = page.get("imageinfo") or []
+                    if infos:
+                        u = infos[0].get("url")
+                        if u and (u.endswith(".webm") or u.endswith(".mp4")):
+                            results.append({
+                                "title": page.get("title", "Historic Video").replace("File:", ""),
+                                "stream_url": u,
+                                "page_url": u
+                            })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    # TIER 3: Pixabay Video Fallback
+    if len(results) < 3 and PIXABAY_API_KEY:
+        try:
+            q_enc = requests.utils.quote(clean_q)
+            url = f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&q={q_enc}&per_page=4"
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                for hit in r.json().get("hits", []):
+                    vids = hit.get("videos", {})
+                    chosen = vids.get("medium") or vids.get("large") or vids.get("small")
+                    if chosen and chosen.get("url"):
+                        results.append({
+                            "title": hit.get("tags") or "Stock B-Roll Video",
+                            "stream_url": chosen["url"],
+                            "page_url": hit.get("pageURL") or chosen["url"]
+                        })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    return results
+
+# =====================================================================
+# LIVE IMAGE SEARCH HELPERS
 # =====================================================================
 def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
     headers = {
@@ -200,14 +313,10 @@ def download_image_buffer(url: str, referer: str = "https://www.google.com/") ->
 
 
 def search_web_open_top3(query: str) -> list[dict]:
-    """
-    Primary: Queries Openverse API (700M+ items across the web, no rate limits on cloud).
-    Fallback: DuckDuckGo images or Wikimedia Commons.
-    """
     clean_q = requests.utils.quote(query.strip())
     results = []
 
-    # Method 1: Openverse API (Clean, unblocked on Cloud)
+    # 1. Openverse API (Cloud Unblocked)
     openverse_url = f"https://api.openverse.org/v1/images/?q={clean_q}&page_size=5"
     headers_ov = {"User-Agent": "BrollStudioArchive/4.0 (contact@brollstudio.org)"}
     try:
@@ -230,7 +339,7 @@ def search_web_open_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # Method 2: DuckDuckGo fallback
+    # 2. DuckDuckGo fallback
     if len(results) < 3 and DDGS is not None:
         try:
             with DDGS() as ddgs:
@@ -251,7 +360,7 @@ def search_web_open_top3(query: str) -> list[dict]:
         except Exception:
             pass
 
-    # Method 3: Wikimedia Commons fallback
+    # 3. Wikimedia Commons fallback
     if len(results) < 3:
         try:
             wiki_url = "https://commons.wikimedia.org/w/api.php"
@@ -1047,17 +1156,21 @@ if "zip_bytes" not in st.session_state:
 if "last_tool_used" not in st.session_state:
     st.session_state.last_tool_used = ""
 
-# Explorer Search State
+# Explorer Search States
 if "catalog_search_results" not in st.session_state:
     st.session_state.catalog_search_results = []
 if "catalog_search_query" not in st.session_state:
     st.session_state.catalog_search_query = ""
 
-# Web Image Explorer State
 if "web_search_results" not in st.session_state:
     st.session_state.web_search_results = []
 if "web_search_query" not in st.session_state:
     st.session_state.web_search_query = ""
+
+if "video_search_results" not in st.session_state:
+    st.session_state.video_search_results = []
+if "video_search_query" not in st.session_state:
+    st.session_state.video_search_query = ""
 
 # =====================================================================
 # AUTHENTICATED WORKSPACE
@@ -1065,7 +1178,7 @@ if "web_search_query" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Open Web Media + Modern Stock + Public Domain (LOC, NARA) + Visit California + Stock Explorers")
+    st.caption("⚡ Live Video Explorer + Open Web Imagery + Modern Stock + Public Domain + Stock Explorers")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -1074,6 +1187,7 @@ with col_logout:
         st.session_state.zip_bytes = None
         st.session_state.catalog_search_results = []
         st.session_state.web_search_results = []
+        st.session_state.video_search_results = []
         st.rerun()
 
 st.divider()
@@ -1096,6 +1210,7 @@ if st.session_state.last_tool_used != selected_tool_name:
     st.session_state.zip_bytes = None
     st.session_state.catalog_search_results = []
     st.session_state.web_search_results = []
+    st.session_state.video_search_results = []
     st.session_state.last_tool_used = selected_tool_name
 
 with col_main:
@@ -1103,9 +1218,75 @@ with col_main:
     st.info(tool_info["desc"])
 
     # =================================================================
-    # TOOL A: WEB OPEN EXPLORER (3 RESULTS + INDIVIDUAL DOWNLOAD)
+    # TOOL 1: LOCATION & AERIAL VIDEO EXPLORER (YT-DLP / 10s TRIM)
     # =================================================================
-    if tool_info["type"] == "web_explorer":
+    if tool_info["type"] == "video_explorer":
+        st.markdown("#### 🎥 **Location & Aerial Video Search**")
+        st.caption("Search real town names, landmarks, drone reels, and b-roll footage. Watch previews directly in the app and download the sliced 10-second MP4 or link.")
+
+        col_vbar, col_vgo = st.columns([3, 1])
+        with col_vbar:
+            v_query = st.text_input(
+                "Enter Video Search Prompt:",
+                placeholder="e.g. Shreveport Louisiana aerial drone, Big Sur highway b-roll, Tokyo Shibuya night rain",
+                label_visibility="collapsed"
+            )
+        with col_vgo:
+            run_v_search = st.button("🔍 **Search Videos**", type="primary", use_container_width=True)
+
+        if run_v_search:
+            if not v_query.strip():
+                st.warning("Please enter a video search prompt.")
+            else:
+                st.session_state.video_search_query = v_query.strip()
+                with st.spinner("Finding geo-specific video streams..."):
+                    items = search_top3_videos(v_query)
+                    st.session_state.video_search_results = items
+
+                if not items:
+                    st.error(f"No video streams returned for '{v_query}'. Try slightly broader location terms.")
+                else:
+                    st.success(f"✓ Found top 3 matching video clips!")
+
+        if st.session_state.video_search_results:
+            st.markdown("---")
+            st.markdown(f"#### **Top 3 Video Clips for: *\"{st.session_state.video_search_query}\"***")
+
+            v_items = st.session_state.video_search_results[:3]
+            v_cols = st.columns(3)
+
+            for idx, item in enumerate(v_items):
+                with v_cols[idx]:
+                    st.video(item["stream_url"])
+                    st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
+
+                    trimmed_out = os.path.join(OUTPUT_DIR, prompt_to_clean_filename(f"{st.session_state.video_search_query}_10s_{idx+1}", "mp4"))
+                    
+                    col_btn_trim, col_btn_full = st.columns(2)
+                    with col_btn_trim:
+                        if st.button(f"✂️ Trim 10s Clip #{idx+1}", key=f"btn_trim_{idx}", use_container_width=True):
+                            with st.spinner("Slicing 10-second MP4..."):
+                                ok, msg = trim_video_stream(item["stream_url"], trimmed_out, duration_sec=10)
+                                if ok and os.path.exists(trimmed_out):
+                                    with open(trimmed_out, "rb") as vf:
+                                        st.download_button(
+                                            label="⬇️ Save 10s MP4",
+                                            data=vf.read(),
+                                            file_name=os.path.basename(trimmed_out),
+                                            mime="video/mp4",
+                                            key=f"dl_v_10s_{idx}",
+                                            type="primary",
+                                            use_container_width=True
+                                        )
+                                else:
+                                    st.error("Trimming failed on remote stream.")
+                    with col_btn_full:
+                        st.link_button("🌐 Full Video", item["page_url"], use_container_width=True)
+
+    # =================================================================
+    # TOOL 2: WEB OPEN IMAGE EXPLORER (3 RESULTS + INDIVIDUAL DOWNLOAD)
+    # =================================================================
+    elif tool_info["type"] == "web_explorer":
         st.markdown("#### 🔍 **Live Open Web Search**")
         st.caption("Search across 700M+ open web images without API keys. Displays top 3 matches in a single row with preview and 1-click download buttons.")
 
@@ -1133,7 +1314,6 @@ with col_main:
                 else:
                     st.success(f"✓ Displaying top 3 results for '{web_query}'!")
 
-        # Render exactly 3 photos in a single clean row with individual download buttons
         if st.session_state.web_search_results:
             st.markdown("---")
             st.markdown(f"#### **Top 3 Web Results for: *\"{st.session_state.web_search_query}\"***")
@@ -1159,7 +1339,7 @@ with col_main:
                     st.link_button("🌐 Open Source URL", item["source_url"], use_container_width=True)
 
     # =================================================================
-    # TOOL B: 3-IMAGE ROW CATALOG EXPLORER (ISTOCK / SHUTTERSTOCK)
+    # TOOL 3: CATALOG EXPLORER (ISTOCK / SHUTTERSTOCK)
     # =================================================================
     elif tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
@@ -1194,7 +1374,6 @@ with col_main:
                 else:
                     st.success(f"✓ Displaying top 3 results from {source_brand.capitalize()}!")
 
-        # Render exactly 3 photos in a single clean row
         if st.session_state.catalog_search_results:
             st.markdown("---")
             st.markdown(f"#### **Top 3 Results for: *\"{st.session_state.catalog_search_query}\"***")
@@ -1250,7 +1429,7 @@ with col_main:
                     components.html(copy_component_html, height=85)
 
     # =================================================================
-    # TOOL C: STOCK & ARCHIVAL BATCH SOURCING
+    # TOOL 4: STOCK & ARCHIVAL BATCH SOURCING
     # =================================================================
     else:
         auth_key_name = tool_info.get("auth_key")
