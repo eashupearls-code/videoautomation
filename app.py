@@ -1,9 +1,9 @@
+import io
 import os
 import re
+import subprocess
 import time
 import zipfile
-import io
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
@@ -14,12 +14,6 @@ try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
-
-# Optional yt-dlp import
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
 
 # Locate FFmpeg
 try:
@@ -43,6 +37,7 @@ def get_secret(key: str, default: str = "") -> str:
 PEXELS_API_KEY = get_secret("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = get_secret("PIXABAY_API_KEY", "")
 UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
+YOUTUBE_API_KEY = get_secret("YOUTUBE_API_KEY", "") or get_secret("GOOGLE_API_KEY", "")
 
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -63,10 +58,10 @@ ARCHIVAL_MODIFIERS = {
 # REPOSITORIES & TOOLS
 # =====================================================================
 TOOLS = {
-    "Location & Aerial Video Explorer (yt-dlp)": {
+    "Location & Aerial Video Explorer": {
         "tag": "video_explorer",
         "ext": "mp4",
-        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll (e.g. Shreveport Louisiana, Big Sur drone). Previews top 3 video streams with 10s slice downloads.",
+        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll footage. Previews top 3 video matches with native playback and 10s slice downloads.",
         "type": "video_explorer",
         "auth_key": None,
         "archival": False
@@ -196,50 +191,74 @@ TOOLS = {
 }
 
 # =====================================================================
-# LOCATION-ACCURATE MULTI-TIER VIDEO ENGINE (YT-DLP / WIKI / STOCK)
+# OFFICIAL YOUTUBE DATA API + RESILIENT LOCATION ENGINE
 # =====================================================================
 def search_top3_videos(query: str) -> list[dict]:
     clean_q = query.strip()
     results = []
 
-    # TIER 1: Geo-Specific Drone & B-Roll Extraction via yt-dlp
-    if yt_dlp is not None:
-        ydl_opts = {
-            "format": "best[ext=mp4]/best",
-            "extract_flat": "in_playlist",
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }
+    # 1. Primary: Official YouTube Data API v3 (Whitelisted on Cloud Servers)
+    if YOUTUBE_API_KEY:
         try:
-            search_query = f"ytsearch4:{clean_q} drone b-roll 4k"
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(search_query, download=False)
-                entries = info.get("entries", [])
-                for entry in entries:
-                    v_id = entry.get("id")
-                    v_url = entry.get("url") or f"https://www.youtube.com/watch?v={v_id}"
-                    title = entry.get("title", f"{clean_q} Footage")
-
-                    try:
-                        with yt_dlp.YoutubeDL({"format": "18/best[ext=mp4]/best", "quiet": True}) as ydl_stream:
-                            sub_info = ydl_stream.extract_info(v_url, download=False)
-                            stream_direct_url = sub_info.get("url")
-                            if stream_direct_url:
-                                results.append({
-                                    "title": title[:55],
-                                    "stream_url": stream_direct_url,
-                                    "page_url": v_url
-                                })
-                    except Exception:
-                        continue
-
-                    if len(results) == 3:
-                        break
+            yt_url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "key": YOUTUBE_API_KEY,
+                "q": f"{clean_q} drone b-roll 4k",
+                "part": "snippet",
+                "type": "video",
+                "maxResults": 3,
+                "videoEmbeddable": "true"
+            }
+            r = requests.get(yt_url, params=params, timeout=10)
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                for item in items:
+                    vid = item.get("id", {}).get("videoId")
+                    snippet = item.get("snippet", {})
+                    title = snippet.get("title", f"{clean_q} Footage")
+                    if vid:
+                        results.append({
+                            "title": title[:55],
+                            "video_id": vid,
+                            "watch_url": f"https://www.youtube.com/watch?v={vid}",
+                            "thumb_url": snippet.get("thumbnails", {}).get("high", {}).get("url", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
+                        })
+                if len(results) == 3:
+                    return results
         except Exception:
             pass
 
-    # TIER 2: Wikimedia Commons Geographic Video Category
+    # 2. Fallback: Invidious Instances (Public Mirrors)
+    try:
+        invidious_instances = [
+            "https://inv.tux.pizza/api/v1/search",
+            "https://invidious.nerdvpn.de/api/v1/search",
+            "https://vid.priv.au/api/v1/search"
+        ]
+        for inst in invidious_instances:
+            try:
+                r_inv = requests.get(inst, params={"q": f"{clean_q} drone 4k", "type": "video"}, timeout=5)
+                if r_inv.status_code == 200:
+                    hits = r_inv.json()
+                    for v in hits:
+                        vid = v.get("videoId")
+                        if vid:
+                            results.append({
+                                "title": v.get("title", f"{clean_q} Video")[:55],
+                                "video_id": vid,
+                                "watch_url": f"https://www.youtube.com/watch?v={vid}",
+                                "thumb_url": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                            })
+                        if len(results) == 3:
+                            break
+                    if len(results) == 3:
+                        return results
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 3. Fallback: Wikimedia Commons Geographical Video Archive
     if len(results) < 3:
         try:
             wiki_url = "https://commons.wikimedia.org/w/api.php"
@@ -249,44 +268,24 @@ def search_top3_videos(query: str) -> list[dict]:
                 "generator": "search",
                 "gsrsearch": f"{clean_q} filetype:video",
                 "gsrnamespace": "6",
-                "gsrlimit": "6",
+                "gsrlimit": "4",
                 "prop": "imageinfo",
                 "iiprop": "url|mime"
             }
-            r = requests.get(wiki_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
-            if r.status_code == 200:
-                pages = r.json().get("query", {}).get("pages", {})
+            r_w = requests.get(wiki_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=8)
+            if r_w.status_code == 200:
+                pages = r_w.json().get("query", {}).get("pages", {})
                 for _, page in pages.items():
                     infos = page.get("imageinfo") or []
                     if infos:
                         u = infos[0].get("url")
                         if u and (u.endswith(".webm") or u.endswith(".mp4")):
                             results.append({
-                                "title": page.get("title", "Historic Video").replace("File:", ""),
-                                "stream_url": u,
-                                "page_url": u
+                                "title": page.get("title", "Historic Video").replace("File:", "")[:55],
+                                "video_id": None,
+                                "watch_url": u,
+                                "thumb_url": ""
                             })
-                    if len(results) == 3:
-                        break
-        except Exception:
-            pass
-
-    # TIER 3: Pixabay Video Fallback
-    if len(results) < 3 and PIXABAY_API_KEY:
-        try:
-            q_enc = requests.utils.quote(clean_q)
-            url = f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&q={q_enc}&per_page=4"
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                for hit in r.json().get("hits", []):
-                    vids = hit.get("videos", {})
-                    chosen = vids.get("medium") or vids.get("large") or vids.get("small")
-                    if chosen and chosen.get("url"):
-                        results.append({
-                            "title": hit.get("tags") or "Stock B-Roll Video",
-                            "stream_url": chosen["url"],
-                            "page_url": hit.get("pageURL") or chosen["url"]
-                        })
                     if len(results) == 3:
                         break
         except Exception:
@@ -1218,17 +1217,20 @@ with col_main:
     st.info(tool_info["desc"])
 
     # =================================================================
-    # TOOL 1: LOCATION & AERIAL VIDEO EXPLORER (YT-DLP / 10s TRIM)
+    # TOOL 1: LOCATION & AERIAL VIDEO EXPLORER (NATIVE EMBEDS & 10s TRIM)
     # =================================================================
     if tool_info["type"] == "video_explorer":
         st.markdown("#### 🎥 **Location & Aerial Video Search**")
-        st.caption("Search real town names, landmarks, drone reels, and b-roll footage. Watch previews directly in the app and download the sliced 10-second MP4 or link.")
+        st.caption("Search real town names, landmarks, and city reels. Displays top 3 matching location videos with native player and 10s slice downloads.")
+
+        if not YOUTUBE_API_KEY:
+            st.warning("⚠️️ For guaranteed unblocked search on Streamlit Cloud, add `YOUTUBE_API_KEY` (or `GOOGLE_API_KEY`) to your Streamlit Secrets.")
 
         col_vbar, col_vgo = st.columns([3, 1])
         with col_vbar:
             v_query = st.text_input(
                 "Enter Video Search Prompt:",
-                placeholder="e.g. Shreveport Louisiana aerial drone, Big Sur highway b-roll, Tokyo Shibuya night rain",
+                placeholder="e.g. Shreveport Louisiana aerial drone, Big Sur highway b-roll, Miami Beach skyline 4k",
                 label_visibility="collapsed"
             )
         with col_vgo:
@@ -1239,14 +1241,14 @@ with col_main:
                 st.warning("Please enter a video search prompt.")
             else:
                 st.session_state.video_search_query = v_query.strip()
-                with st.spinner("Finding geo-specific video streams..."):
+                with st.spinner("Finding geo-specific video reels..."):
                     items = search_top3_videos(v_query)
                     st.session_state.video_search_results = items
 
                 if not items:
-                    st.error(f"No video streams returned for '{v_query}'. Try slightly broader location terms.")
+                    st.error(f"No video streams returned for '{v_query}'. Ensure your API key is enabled or try broader city terms.")
                 else:
-                    st.success(f"✓ Found top 3 matching video clips!")
+                    st.success(f"✓ Found top 3 videos for '{v_query}'!")
 
         if st.session_state.video_search_results:
             st.markdown("---")
@@ -1257,31 +1259,44 @@ with col_main:
 
             for idx, item in enumerate(v_items):
                 with v_cols[idx]:
-                    st.video(item["stream_url"])
-                    st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
+                    st.video(item["watch_url"])
+                    st.caption(f"**{item['title']}**")
 
-                    trimmed_out = os.path.join(OUTPUT_DIR, prompt_to_clean_filename(f"{st.session_state.video_search_query}_10s_{idx+1}", "mp4"))
+                    clean_name = prompt_to_clean_filename(f"{st.session_state.video_search_query}_10s_{idx+1}", "mp4")
+                    trimmed_out = os.path.join(OUTPUT_DIR, clean_name)
                     
                     col_btn_trim, col_btn_full = st.columns(2)
                     with col_btn_trim:
                         if st.button(f"✂️ Trim 10s Clip #{idx+1}", key=f"btn_trim_{idx}", use_container_width=True):
                             with st.spinner("Slicing 10-second MP4..."):
-                                ok, msg = trim_video_stream(item["stream_url"], trimmed_out, duration_sec=10)
-                                if ok and os.path.exists(trimmed_out):
+                                cmd = [
+                                    "yt-dlp",
+                                    "--force-overwrites",
+                                    "--download-sections", "*00:00:00-00:00:10",
+                                    "-f", "best[ext=mp4]/best",
+                                    "-o", trimmed_out,
+                                    item["watch_url"]
+                                ]
+                                try:
+                                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+                                except Exception:
+                                    pass
+
+                                if os.path.exists(trimmed_out) and os.path.getsize(trimmed_out) > 1000:
                                     with open(trimmed_out, "rb") as vf:
                                         st.download_button(
                                             label="⬇️ Save 10s MP4",
                                             data=vf.read(),
-                                            file_name=os.path.basename(trimmed_out),
+                                            file_name=clean_name,
                                             mime="video/mp4",
                                             key=f"dl_v_10s_{idx}",
                                             type="primary",
                                             use_container_width=True
                                         )
                                 else:
-                                    st.error("Trimming failed on remote stream.")
+                                    st.info("Direct slice limited on host. Use 'Watch Full' below to view/grab original:")
                     with col_btn_full:
-                        st.link_button("🌐 Full Video", item["page_url"], use_container_width=True)
+                        st.link_button("🌐 Watch Full", item["watch_url"], use_container_width=True)
 
     # =================================================================
     # TOOL 2: WEB OPEN IMAGE EXPLORER (3 RESULTS + INDIVIDUAL DOWNLOAD)
@@ -1557,10 +1572,9 @@ with col_main:
                     st.markdown(f"**Filename:** `{r['filename']}`")
                     st.caption(f"File Size: {r['detail']}")
 
-                    # Download button for the exact trimmed file created on the server
                     if r.get("file_bytes"):
                         st.download_button(
-                            label=f"⬇️ **Download {r['filename']}**",
+                            label=f"⬇️️ **Download {r['filename']}**",
                             data=r["file_bytes"],
                             file_name=r["filename"],
                             mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
