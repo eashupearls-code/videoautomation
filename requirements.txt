@@ -2,3 +2,4 @@ streamlit
 requests
 imageio-ffmpeg
 duckduckgo_search
+yt-dlp
