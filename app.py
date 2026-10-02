@@ -67,7 +67,7 @@ TOOLS = {
     "Location & Aerial Video Explorer": {
         "tag": "video_explorer",
         "ext": "mp4",
-        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll footage. Displays videos vertically with custom start & end trim timestamps.",
+        "desc": "Search live geo-specific aerials, municipal landmarks, and b-roll footage. Displays videos vertically with custom start & end timestamp trimming controls.",
         "type": "video_explorer",
         "auth_key": None,
         "archival": False
@@ -267,14 +267,32 @@ def search_top3_videos(query: str) -> list[dict]:
     return results
 
 # =====================================================================
-# CLOUD-HARDENED YOUTUBE TRIMMER (TIMESTAMPS: START TO END)
+# CLOUD-RESILIENT YOUTUBE TRIMMER
 # =====================================================================
 def get_cloud_direct_stream(video_id: str, watch_url: str) -> str | None:
-    # 1. Query Invidious API for a clean, direct MP4 playback link
+    # 1. Piped API instances (High speed, cloud whitelisted)
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://api.piped.privacy.com.de",
+        "https://piped-api.garudalinux.org"
+    ]
+    for p_host in piped_instances:
+        try:
+            r = requests.get(f"{p_host}/streams/{video_id}", timeout=5)
+            if r.status_code == 200:
+                streams = r.json().get("videoStreams", [])
+                for s in streams:
+                    if s.get("format") == "MPEG_4" or "video/mp4" in s.get("mimeType", ""):
+                        if s.get("url"):
+                            return s.get("url")
+        except Exception:
+            continue
+
+    # 2. Invidious API format streams
     invidious_hosts = ["https://inv.tux.pizza", "https://invidious.nerdvpn.de", "https://vid.priv.au"]
     for host in invidious_hosts:
         try:
-            r = requests.get(f"{host}/api/v1/videos/{video_id}", timeout=6)
+            r = requests.get(f"{host}/api/v1/videos/{video_id}", timeout=5)
             if r.status_code == 200:
                 fmt_streams = r.json().get("formatStreams", [])
                 for stream in fmt_streams:
@@ -284,17 +302,7 @@ def get_cloud_direct_stream(video_id: str, watch_url: str) -> str | None:
         except Exception:
             continue
 
-    # 2. Query Cobalt Public API
-    try:
-        c_payload = {"url": watch_url, "videoQuality": "720"}
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        r_c = requests.post("https://api.cobalt.tools/api/json", json=c_payload, headers=headers, timeout=8)
-        if r_c.status_code == 200 and r_c.json().get("url"):
-            return r_c.json().get("url")
-    except Exception:
-        pass
-
-    # 3. yt-dlp stream extraction with android client token
+    # 3. yt-dlp android / ios client bypass
     if yt_dlp is not None:
         try:
             ydl_opts = {
@@ -314,11 +322,10 @@ def get_cloud_direct_stream(video_id: str, watch_url: str) -> str | None:
 def trim_youtube_clip(video_id: str, watch_url: str, output_path: str, start_sec: int, end_sec: int) -> tuple[bool, str]:
     duration = max(1, end_sec - start_sec)
     
-    # Step A: Resolve direct MP4 stream URL
+    # Resolve stream through open proxy gateways
     direct_stream = get_cloud_direct_stream(video_id, watch_url)
     
     if direct_stream:
-        # Step B: Fast slice with FFmpeg
         cmd = [
             FFMPEG_EXE, "-y",
             "-user_agent", GLOBAL_USER_AGENT,
@@ -340,7 +347,7 @@ def trim_youtube_clip(video_id: str, watch_url: str, output_path: str, start_sec
         except Exception:
             pass
 
-    # Step C: Subprocess fallback via yt-dlp section download
+    # yt-dlp section download fallback
     cmd_cli = [
         "yt-dlp",
         "--force-overwrites",
@@ -358,7 +365,7 @@ def trim_youtube_clip(video_id: str, watch_url: str, output_path: str, start_sec
     except Exception as e:
         return False, str(e)
 
-    return False, "Cloud host IP throttled. Please view or grab directly from original link."
+    return False, "Cloud host throttled. Please use ✂️ Direct Web Cut below."
 
 # =====================================================================
 # LIVE IMAGE SEARCH HELPERS
@@ -566,7 +573,7 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
 
 
 # =====================================================================
-# TWO-STAGE TRIMMING PIPELINE (SOLVES PEXELS CDN HANGS)
+# TWO-STAGE TRIMMING PIPELINE (FIXES PEXELS CDN TIMEOUTS)
 # =====================================================================
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
     temp_raw_file = f"{output_path}.temp_raw.mp4"
@@ -574,7 +581,6 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
     # Step 1: Download raw file safely to a local temp buffer first
     download_ok, download_msg = download_stream(cdn_url, temp_raw_file, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
     if not download_ok or not os.path.exists(temp_raw_file):
-        # Fallback to direct network slicing
         cmd_direct = [
             FFMPEG_EXE, "-y",
             "-headers", f"User-Agent: {GLOBAL_USER_AGENT}\r\n",
@@ -610,7 +616,6 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
         ]
         subprocess.run(cmd_fast, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
         
-        # Fallback re-encode if keyframe copy fails
         if not (os.path.exists(output_path) and os.path.getsize(output_path) > 1000):
             cmd_reencode = [
                 FFMPEG_EXE, "-y",
@@ -1120,7 +1125,7 @@ with col_main:
                 
                 with col_controls:
                     st.markdown("##### ⏱️ **Clip Trimmer Controls**")
-                    st.caption("Play video on the left, note down your preferred start and end seconds, then slice:")
+                    st.caption("Play video on the left, set your start and end seconds, then slice:")
 
                     col_s, col_e = st.columns(2)
                     with col_s:
@@ -1156,7 +1161,7 @@ with col_main:
                                 st.session_state[f"sliced_{idx}"] = trimmed_out
                                 st.success(f"✓ Trimmed successfully! ({msg})")
                             else:
-                                st.error(f"Trimming error: {msg}")
+                                st.error(f"Server-side slice failed on host. Use Direct Web Cut below:")
 
                     if st.session_state.get(f"sliced_{idx}") and os.path.exists(st.session_state[f"sliced_{idx}"]):
                         with open(st.session_state[f"sliced_{idx}"], "rb") as vf:
@@ -1170,7 +1175,13 @@ with col_main:
                                 use_container_width=True
                             )
 
-                    st.link_button("🌐 Watch Full Video on YouTube", item["watch_url"], use_container_width=True)
+                    # Direct Web Cut helper (opens timestamp slice directly in browser)
+                    yt_cut_url = f"https://ytcutter.net/watch?v={item.get('video_id', '')}&start={start_time}&end={end_time}"
+                    col_cut_btn, col_yt_btn = st.columns(2)
+                    with col_cut_btn:
+                        st.link_button("✂️ Direct Web Cut", yt_cut_url, use_container_width=True)
+                    with col_yt_btn:
+                        st.link_button("🌐 Watch Full", item["watch_url"], use_container_width=True)
                 
                 st.divider()
 
@@ -1219,7 +1230,7 @@ with col_main:
 
                     clean_fname = prompt_to_clean_filename(f"{st.session_state.web_search_query}_{idx+1}", "jpg")
                     st.download_button(
-                        label=f"⬇️ **Download Image #{idx+1}**",
+                        label=f"⬇️️ **Download Image #{idx+1}**",
                         data=item["image_bytes"],
                         file_name=clean_fname,
                         mime="image/jpeg",
