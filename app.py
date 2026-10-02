@@ -9,6 +9,12 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
+# Optional DuckDuckGo package import
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+
 # Locate FFmpeg
 try:
     import imageio_ffmpeg
@@ -51,6 +57,14 @@ ARCHIVAL_MODIFIERS = {
 # REPOSITORIES & TOOLS
 # =====================================================================
 TOOLS = {
+    "Web Open Image Search (DuckDuckGo)": {
+        "tag": "ddg_photo",
+        "ext": "jpg",
+        "desc": "Famous for: Open web search across all domains without API keys, cards, or restrictions. Direct image previews & downloads.",
+        "type": "photo",
+        "auth_key": None,
+        "archival": False
+    },
     "Stock Video Footage (Pexels)": {
         "tag": "pexels_video",
         "ext": "mp4",
@@ -166,6 +180,26 @@ TOOLS = {
         "archival": False
     }
 }
+
+# =====================================================================
+# DUCKLUCKGO WEB IMAGE SEARCH ENGINE
+# =====================================================================
+def fetch_duckduckgo_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
+    if DDGS is None:
+        return False, "duckduckgo_search package not installed. Add it to requirements.txt", None
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=6))
+            for item in results:
+                img_url = item.get("image") or item.get("thumbnail")
+                if img_url:
+                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+                    if ok:
+                        return True, f"{detail} (Web Image)", img_url
+        return False, f"No DuckDuckGo images found for '{query}'", None
+    except Exception as e:
+        return False, f"Search error: {e}", None
 
 # =====================================================================
 # LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
@@ -698,12 +732,8 @@ def fetch_loc_photo(query: str, out_path: str, _q: str = "", _c: int | None = No
         return False, str(e), None
 
 
-# =====================================================================
-# NATIONAL ARCHIVES (NARA) REPOSITORY ENGINES
-# =====================================================================
 def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
     headers = {"User-Agent": GLOBAL_USER_AGENT}
-    # 1. Direct NARA Proxy Search
     try:
         url = "https://catalog.archives.gov/proxy/v3/records/search"
         params = {"q": query, "typeOfMaterials": "moving images", "limit": 5}
@@ -725,7 +755,6 @@ def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int 
     except Exception:
         pass
 
-    # 2. Archive.org FedFlix (National Archives official film collection)
     try:
         ia_url = "https://archive.org/advancedsearch.php"
         params = {
@@ -779,62 +808,43 @@ def fetch_nara_photo(query: str, out_path: str, _q: str = "", _c: int | None = N
     except Exception:
         pass
 
-    # High-quality Wikimedia National Archives collection fallback
     return fetch_wikimedia_stills(f"{query} National Archives and Records Administration", out_path)
 
 
-# =====================================================================
-# VISIT CALIFORNIA REPOSITORY ENGINES (NO API KEY REQUIRED)
-# =====================================================================
 def fetch_visit_california_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
-    """
-    Slices official California destination video and b-roll (Yosemite, Big Sur, PCH, San Francisco,
-    Los Angeles, Redwoods, San Diego) automatically framed to the selected duration.
-    """
     california_query = f"{query} California" if "california" not in query.lower() else query
 
-    # 1. Pexels Edge Engine with California curation
     if PEXELS_API_KEY:
         ok, msg, cdn = fetch_pexels_video(california_query, out_path, quality_choice, clip_seconds)
         if ok:
             return True, f"{msg} (Visit California Video)", cdn
 
-    # 2. Pixabay Edge Engine
     if PIXABAY_API_KEY:
         ok, msg, cdn = fetch_pixabay_video(california_query, out_path, quality_choice, clip_seconds)
         if ok:
             return True, f"{msg} (Visit California Video)", cdn
 
-    # 3. Public domain Library of Congress California Reels
     return fetch_loc_video(california_query, out_path, clip_seconds=clip_seconds)
 
 
 def fetch_visit_california_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    """
-    Retrieves high-resolution California travel photography (coastal highways, national parks,
-    urban landmarks, vineyards, and beaches).
-    """
     california_query = f"{query} California" if "california" not in query.lower() else query
 
-    # 1. Unsplash Editorial California Gallery
     if UNSPLASH_ACCESS_KEY:
         ok, msg, url = fetch_unsplash_photo(california_query, out_path)
         if ok:
             return True, f"{msg} (Visit California Stills)", url
 
-    # 2. Pexels California Stills
     if PEXELS_API_KEY:
         ok, msg, url = fetch_pexels_photo(california_query, out_path)
         if ok:
             return True, f"{msg} (Visit California Stills)", url
 
-    # 3. Pixabay Travel Stills
     if PIXABAY_API_KEY:
         ok, msg, url = fetch_pixabay_photo(california_query, out_path)
         if ok:
             return True, f"{msg} (Visit California Stills)", url
 
-    # 4. Public Domain Archival Scans
     return fetch_wikimedia_stills(california_query, out_path)
 
 
@@ -842,6 +852,7 @@ def fetch_visit_california_photo(query: str, out_path: str, _q: str = "", _c: in
 # THREAD DISPATCH & MEMORY ZIP
 # =====================================================================
 ENGINE_MAP = {
+    "Web Open Image Search (DuckDuckGo)": fetch_duckduckgo_photo,
     "Stock Video Footage (Pexels)": fetch_pexels_video,
     "Stock Photos (Pexels)": fetch_pexels_photo,
     "Pixabay Video Footage": fetch_pixabay_video,
@@ -980,7 +991,7 @@ if "catalog_search_query" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives (LOC, NARA) + Visit California + Stock Link Extractors")
+    st.caption("⚡ DuckDuckGo Web Imagery + Modern Stock + Public Domain (LOC, NARA) + Visit California + Stock Explorers")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -1235,10 +1246,10 @@ with col_main:
                     st.markdown(f"**Filename:** `{r['filename']}`")
                     st.caption(f"File Size: {r['detail']}")
 
-                    # Download button for the exact 10s/15s cut created on the server
+                    # Download button for the exact trimmed file created on the server
                     if r.get("file_bytes"):
                         st.download_button(
-                            label=f"⬇️ **Download {r['filename']}**",
+                            label=f"⬇️️ **Download {r['filename']}**",
                             data=r["file_bytes"],
                             file_name=r["filename"],
                             mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
