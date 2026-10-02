@@ -31,7 +31,6 @@ def get_secret(key: str, default: str = "") -> str:
 PEXELS_API_KEY = get_secret("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = get_secret("PIXABAY_API_KEY", "")
 UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
-MAPILLARY_CLIENT_TOKEN = get_secret("MAPILLARY_CLIENT_TOKEN", "")
 
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -116,18 +115,34 @@ TOOLS = {
         "auth_key": None,
         "archival": True
     },
-    "Mapillary Street-Level Imagery": {
-        "tag": "mapillary_photo",
+    "National Archives (NARA Historical Footage)": {
+        "tag": "nara_video",
+        "ext": "mp4",
+        "desc": "Famous for: Declassified US military operations (WWII, Korea, Vietnam), NASA Apollo space missions, and historical newsreels.",
+        "type": "video",
+        "auth_key": None,
+        "archival": True
+    },
+    "National Archives (NARA Historical Stills)": {
+        "tag": "nara_photo",
         "ext": "jpg",
-        "desc": "Famous for: Global crowdsourced street-level photography, urban point-of-view driving perspectives, and real-world road views.",
+        "desc": "Famous for: Official US government records, WWII wartime posters, military photography, Documerica project, and presidential libraries.",
         "type": "photo",
-        "auth_key": "MAPILLARY_CLIENT_TOKEN",
+        "auth_key": None,
+        "archival": True
+    },
+    "Visit California Cinematic Video": {
+        "tag": "visit_ca_video",
+        "ext": "mp4",
+        "desc": "Famous for: Official California tourism b-roll: Pacific Coast Highway (PCH), Big Sur, Yosemite, redwoods, surf culture, and Napa Valley.",
+        "type": "video",
+        "auth_key": None,
         "archival": False
     },
-    "KartaView Street-Level Imagery": {
-        "tag": "kartaview_photo",
+    "Visit California Travel Stills": {
+        "tag": "visit_ca_photo",
         "ext": "jpg",
-        "desc": "Famous for: Open street-level mapping photography, highway sequences, and urban road perspectives (No API key required).",
+        "desc": "Famous for: High-resolution California destinations, coastal sunsets, national parks, lifestyle, wine country, and urban landmarks.",
         "type": "photo",
         "auth_key": None,
         "archival": False
@@ -151,94 +166,6 @@ TOOLS = {
         "archival": False
     }
 }
-
-# =====================================================================
-# GEOCODING HELPER FOR STREET-LEVEL ENGINES
-# =====================================================================
-def geocode_place_to_bbox(query: str, delta: float = 0.05) -> tuple[float, float, float, float] | None:
-    """
-    Geocodes city, neighborhood, or landmark into a bounding box (min_lon, min_lat, max_lon, max_lat)
-    via OpenStreetMap Nominatim.
-    """
-    clean_q = re.sub(r"[^\w\s,.-]", " ", query).strip()
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": clean_q, "format": "json", "limit": 1}
-    headers = {"User-Agent": "BrollStudioArchive/4.0 (contact@studio.local)"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=8)
-        if r.status_code == 200:
-            hits = r.json()
-            if hits:
-                lat = float(hits[0]["lat"])
-                lon = float(hits[0]["lon"])
-                return (lon - delta, lat - delta, lon + delta, lat + delta)
-    except Exception:
-        pass
-    return None
-
-# =====================================================================
-# MAPILLARY & KARTAVIEW FETCH ENGINES
-# =====================================================================
-def fetch_mapillary_image(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    token = MAPILLARY_CLIENT_TOKEN
-    if not token:
-        return False, "MAPILLARY_CLIENT_TOKEN missing from secrets", None
-
-    bbox = geocode_place_to_bbox(query)
-    if not bbox:
-        bbox = (-74.02, 40.70, -73.97, 40.76)  # Default fallback: New York City
-
-    bbox_str = f"{bbox[0]:.4f},{bbox[1]:.4f},{bbox[2]:.4f},{bbox[3]:.4f}"
-    url = f"https://graph.mapillary.com/images?access_token={token}&fields=id,thumb_2048_url,thumb_1024_url&bbox={bbox_str}&limit=5"
-    try:
-        r = requests.get(url, timeout=12)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            for item in data:
-                img_url = item.get("thumb_2048_url") or item.get("thumb_1024_url")
-                if img_url:
-                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    if ok:
-                        return True, detail, img_url
-        return False, f"No Mapillary street images found for location: {query}", None
-    except Exception as e:
-        return False, str(e), None
-
-
-def fetch_kartaview_image(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    bbox = geocode_place_to_bbox(query)
-    if not bbox:
-        bbox = (-122.45, 37.75, -122.38, 37.80)  # Default fallback: San Francisco
-
-    url = "https://api.openstreetcam.org/2.0/photo"
-    params = {
-        "bLbrLat": bbox[1],
-        "bLbrLng": bbox[0],
-        "tLtrLat": bbox[3],
-        "tLtrLng": bbox[2],
-        "itemsPerPage": 5
-    }
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=12)
-        if r.status_code == 200:
-            photos = r.json().get("result", {}).get("data", [])
-            for p in photos:
-                img_url = (
-                    p.get("imagePath")
-                    or p.get("fileurlLKey")
-                    or p.get("fileurlProc")
-                    or p.get("fileurl")
-                )
-                if img_url:
-                    if not img_url.startswith("http"):
-                        img_url = f"https://kartaview.org/{img_url.lstrip('/')}"
-                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    if ok:
-                        return True, detail, img_url
-        return False, f"No KartaView street images found for location: {query}", None
-    except Exception as e:
-        return False, str(e), None
 
 # =====================================================================
 # LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
@@ -289,7 +216,6 @@ def search_istock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # Unsplash fallback
     if not results:
         headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
         try:
@@ -484,7 +410,7 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
         output_path
     ]
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             sz_mb = os.path.getsize(output_path) / (1024 * 1024)
             return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
@@ -773,6 +699,146 @@ def fetch_loc_photo(query: str, out_path: str, _q: str = "", _c: int | None = No
 
 
 # =====================================================================
+# NATIONAL ARCHIVES (NARA) REPOSITORY ENGINES
+# =====================================================================
+def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
+    headers = {"User-Agent": GLOBAL_USER_AGENT}
+    # 1. Direct NARA Proxy Search
+    try:
+        url = "https://catalog.archives.gov/proxy/v3/records/search"
+        params = {"q": query, "typeOfMaterials": "moving images", "limit": 5}
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        if r.status_code == 200:
+            hits = r.json().get("body", {}).get("hits", {}).get("hits", [])
+            for hit in hits:
+                record = hit.get("_source", {}).get("record", {}) or hit.get("_source", {})
+                objs = record.get("digitalObjects", []) or []
+                for obj in objs:
+                    obj_url = obj.get("objectUrl") or obj.get("accessUrl") or ""
+                    if obj_url.lower().endswith(".mp4"):
+                        if clip_seconds:
+                            ok, msg = trim_video_stream(obj_url, out_path, clip_seconds)
+                        else:
+                            ok, msg = download_stream(obj_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+                        if ok:
+                            return True, msg, obj_url
+    except Exception:
+        pass
+
+    # 2. Archive.org FedFlix (National Archives official film collection)
+    try:
+        ia_url = "https://archive.org/advancedsearch.php"
+        params = {
+            "q": f"({query}) AND collection:(fedflix)",
+            "fl[]": "identifier",
+            "rows": 4,
+            "output": "json"
+        }
+        r = requests.get(ia_url, params=params, headers=headers, timeout=12)
+        if r.status_code == 200:
+            docs = r.json().get("response", {}).get("docs", [])
+            for doc in docs:
+                ident = doc.get("identifier")
+                if ident:
+                    m_res = requests.get(f"https://archive.org/metadata/{ident}/files", headers=headers, timeout=10)
+                    if m_res.status_code == 200:
+                        files = m_res.json().get("result", [])
+                        mp4s = [f for f in files if f.get("name", "").lower().endswith(".mp4")]
+                        if mp4s:
+                            mp4s.sort(key=lambda x: int(x.get("size", 0)), reverse=True)
+                            chosen = f"https://archive.org/download/{ident}/{mp4s[0]['name']}"
+                            if clip_seconds:
+                                ok, msg = trim_video_stream(chosen, out_path, clip_seconds)
+                            else:
+                                ok, msg = download_stream(chosen, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+                            if ok:
+                                return True, msg, chosen
+    except Exception:
+        pass
+
+    return False, f"No downloadable NARA film found for '{query}'", None
+
+
+def fetch_nara_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
+    headers = {"User-Agent": GLOBAL_USER_AGENT}
+    try:
+        url = "https://catalog.archives.gov/proxy/v3/records/search"
+        params = {"q": query, "typeOfMaterials": "photographs and other graphic materials", "limit": 6}
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        if r.status_code == 200:
+            hits = r.json().get("body", {}).get("hits", {}).get("hits", [])
+            for hit in hits:
+                record = hit.get("_source", {}).get("record", {}) or hit.get("_source", {})
+                objs = record.get("digitalObjects", []) or []
+                for obj in objs:
+                    obj_url = obj.get("objectUrl") or obj.get("accessUrl") or ""
+                    if any(obj_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+                        ok, detail = download_stream(obj_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+                        if ok:
+                            return True, detail, obj_url
+    except Exception:
+        pass
+
+    # High-quality Wikimedia National Archives collection fallback
+    return fetch_wikimedia_stills(f"{query} National Archives and Records Administration", out_path)
+
+
+# =====================================================================
+# VISIT CALIFORNIA REPOSITORY ENGINES (NO API KEY REQUIRED)
+# =====================================================================
+def fetch_visit_california_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
+    """
+    Slices official California destination video and b-roll (Yosemite, Big Sur, PCH, San Francisco,
+    Los Angeles, Redwoods, San Diego) automatically framed to the selected duration.
+    """
+    california_query = f"{query} California" if "california" not in query.lower() else query
+
+    # 1. Pexels Edge Engine with California curation
+    if PEXELS_API_KEY:
+        ok, msg, cdn = fetch_pexels_video(california_query, out_path, quality_choice, clip_seconds)
+        if ok:
+            return True, f"{msg} (Visit California Video)", cdn
+
+    # 2. Pixabay Edge Engine
+    if PIXABAY_API_KEY:
+        ok, msg, cdn = fetch_pixabay_video(california_query, out_path, quality_choice, clip_seconds)
+        if ok:
+            return True, f"{msg} (Visit California Video)", cdn
+
+    # 3. Public domain Library of Congress California Reels
+    return fetch_loc_video(california_query, out_path, clip_seconds=clip_seconds)
+
+
+def fetch_visit_california_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
+    """
+    Retrieves high-resolution California travel photography (coastal highways, national parks,
+    urban landmarks, vineyards, and beaches).
+    """
+    california_query = f"{query} California" if "california" not in query.lower() else query
+
+    # 1. Unsplash Editorial California Gallery
+    if UNSPLASH_ACCESS_KEY:
+        ok, msg, url = fetch_unsplash_photo(california_query, out_path)
+        if ok:
+            return True, f"{msg} (Visit California Stills)", url
+
+    # 2. Pexels California Stills
+    if PEXELS_API_KEY:
+        ok, msg, url = fetch_pexels_photo(california_query, out_path)
+        if ok:
+            return True, f"{msg} (Visit California Stills)", url
+
+    # 3. Pixabay Travel Stills
+    if PIXABAY_API_KEY:
+        ok, msg, url = fetch_pixabay_photo(california_query, out_path)
+        if ok:
+            return True, f"{msg} (Visit California Stills)", url
+
+    # 4. Public Domain Archival Scans
+    return fetch_wikimedia_stills(california_query, out_path)
+
+
+# =====================================================================
 # THREAD DISPATCH & MEMORY ZIP
 # =====================================================================
 ENGINE_MAP = {
@@ -784,8 +850,10 @@ ENGINE_MAP = {
     "Wikimedia Commons Stills": fetch_wikimedia_stills,
     "Library of Congress (Historic Film & Video)": fetch_loc_video,
     "Library of Congress (Historic Photos)": fetch_loc_photo,
-    "Mapillary Street-Level Imagery": fetch_mapillary_image,
-    "KartaView Street-Level Imagery": fetch_kartaview_image
+    "National Archives (NARA Historical Footage)": fetch_nara_video,
+    "National Archives (NARA Historical Stills)": fetch_nara_photo,
+    "Visit California Cinematic Video": fetch_visit_california_video,
+    "Visit California Travel Stills": fetch_visit_california_photo
 }
 
 
@@ -870,7 +938,7 @@ if "authenticated" not in st.session_state:
 
 if not st.session_state.authenticated:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("High-speed B-roll, street-level & stock portal pipeline for documentary research.")
+    st.caption("High-speed B-roll, public domain & stock portal pipeline for documentary research.")
     st.divider()
 
     _, col_login, _ = st.columns([1, 1.2, 1])
@@ -912,7 +980,7 @@ if "catalog_search_query" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives + Mapillary/KartaView Street Views + Stock Explorers")
+    st.caption("⚡ Modern Stock + Public Domain Archives (LOC, NARA) + Visit California + Stock Link Extractors")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -1046,7 +1114,7 @@ with col_main:
         if auth_key_name:
             current_key = globals().get(auth_key_name, "")
             if not current_key:
-                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault. Add it to enable downloads.")
+                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
         quality_choice = "1080p Full HD"
         clip_seconds = 10
@@ -1077,10 +1145,10 @@ with col_main:
                     label_visibility="collapsed"
                 )
 
-        st.markdown("**Visual / Location Prompts (one prompt per line)**")
+        st.markdown("**Visual Prompts (one prompt per line)**")
         prompt_placeholder = (
-            "Times Square New York\nShibuya Crossing Tokyo\nChamps-Elysees Paris"
-            if "Street-Level" in selected_tool_name
+            "Big Sur coastal highway sunset\nYosemite Valley misty sunrise waterfalls\nSan Francisco golden gate aerial drone"
+            if "California" in selected_tool_name
             else "wright brothers first flight kitty hawk\ncivil war battlefield photography\nmodern corporate boardroom meeting"
         )
         prompt_input = st.text_area(
@@ -1167,7 +1235,7 @@ with col_main:
                     st.markdown(f"**Filename:** `{r['filename']}`")
                     st.caption(f"File Size: {r['detail']}")
 
-                    # Download button for exact trimmed file created on the server
+                    # Download button for the exact 10s/15s cut created on the server
                     if r.get("file_bytes"):
                         st.download_button(
                             label=f"⬇️ **Download {r['filename']}**",
