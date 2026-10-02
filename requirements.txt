@@ -1,5 +1,4 @@
 streamlit
 requests
-yt-dlp
 imageio-ffmpeg
-youtube-transcript-api
+duckduckgo_search
