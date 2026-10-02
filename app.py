@@ -9,7 +9,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Optional DuckDuckGo package import
+# Optional DuckDuckGo import
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -57,11 +57,11 @@ ARCHIVAL_MODIFIERS = {
 # REPOSITORIES & TOOLS
 # =====================================================================
 TOOLS = {
-    "Web Open Image Search (DuckDuckGo)": {
-        "tag": "ddg_photo",
+    "Web Open Image Search (Openverse & Web)": {
+        "tag": "web_photo_search",
         "ext": "jpg",
-        "desc": "Famous for: Open web search across all domains without API keys, cards, or restrictions. Direct image previews & downloads.",
-        "type": "photo",
+        "desc": "Famous for: Open web search across 700M+ images (Flickr, public archives, web hubs). Top 3 preview row with 1-click downloads.",
+        "type": "web_explorer",
         "auth_key": None,
         "archival": False
     },
@@ -182,27 +182,7 @@ TOOLS = {
 }
 
 # =====================================================================
-# DUCKLUCKGO WEB IMAGE SEARCH ENGINE
-# =====================================================================
-def fetch_duckduckgo_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    if DDGS is None:
-        return False, "duckduckgo_search package not installed. Add it to requirements.txt", None
-
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=6))
-            for item in results:
-                img_url = item.get("image") or item.get("thumbnail")
-                if img_url:
-                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    if ok:
-                        return True, f"{detail} (Web Image)", img_url
-        return False, f"No DuckDuckGo images found for '{query}'", None
-    except Exception as e:
-        return False, f"Search error: {e}", None
-
-# =====================================================================
-# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
+# LIVE CATALOG SEARCH HELPERS
 # =====================================================================
 def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
     headers = {
@@ -217,6 +197,95 @@ def download_image_buffer(url: str, referer: str = "https://www.google.com/") ->
     except Exception:
         pass
     return None
+
+
+def search_web_open_top3(query: str) -> list[dict]:
+    """
+    Primary: Queries Openverse API (700M+ items across the web, no rate limits on cloud).
+    Fallback: DuckDuckGo images or Wikimedia Commons.
+    """
+    clean_q = requests.utils.quote(query.strip())
+    results = []
+
+    # Method 1: Openverse API (Clean, unblocked on Cloud)
+    openverse_url = f"https://api.openverse.org/v1/images/?q={clean_q}&page_size=5"
+    headers_ov = {"User-Agent": "BrollStudioArchive/4.0 (contact@brollstudio.org)"}
+    try:
+        r = requests.get(openverse_url, headers=headers_ov, timeout=10)
+        if r.status_code == 200:
+            hits = r.json().get("results", [])
+            for item in hits:
+                img_url = item.get("url")
+                if not img_url:
+                    continue
+                img_data = download_image_buffer(img_url)
+                if img_data:
+                    results.append({
+                        "title": item.get("title") or "Web B-roll Image",
+                        "image_bytes": img_data,
+                        "source_url": item.get("foreign_landing_url") or img_url
+                    })
+                if len(results) == 3:
+                    break
+    except Exception:
+        pass
+
+    # Method 2: DuckDuckGo fallback
+    if len(results) < 3 and DDGS is not None:
+        try:
+            with DDGS() as ddgs:
+                ddg_hits = list(ddgs.images(query.strip(), max_results=6))
+                for item in ddg_hits:
+                    img_url = item.get("image") or item.get("thumbnail")
+                    if not img_url:
+                        continue
+                    img_data = download_image_buffer(img_url, referer="https://duckduckgo.com/")
+                    if img_data:
+                        results.append({
+                            "title": item.get("title") or "Web B-roll Image",
+                            "image_bytes": img_data,
+                            "source_url": item.get("url") or img_url
+                        })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    # Method 3: Wikimedia Commons fallback
+    if len(results) < 3:
+        try:
+            wiki_url = "https://commons.wikimedia.org/w/api.php"
+            params = {
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": f"{query} filetype:bitmap",
+                "gsrnamespace": "6",
+                "gsrlimit": "6",
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "iiurlwidth": "1280"
+            }
+            r = requests.get(wiki_url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
+            if r.status_code == 200:
+                pages = r.json().get("query", {}).get("pages", {})
+                for _, page in pages.items():
+                    infos = page.get("imageinfo") or []
+                    if infos:
+                        u = infos[0].get("thumburl") or infos[0].get("url")
+                        b = download_image_buffer(u)
+                        if b:
+                            results.append({
+                                "title": page.get("title", "Archival Still").replace("File:", ""),
+                                "image_bytes": b,
+                                "source_url": infos[0].get("descriptionurl") or u
+                            })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    return results
 
 
 def search_istock_top3(query: str) -> list[dict]:
@@ -852,7 +921,6 @@ def fetch_visit_california_photo(query: str, out_path: str, _q: str = "", _c: in
 # THREAD DISPATCH & MEMORY ZIP
 # =====================================================================
 ENGINE_MAP = {
-    "Web Open Image Search (DuckDuckGo)": fetch_duckduckgo_photo,
     "Stock Video Footage (Pexels)": fetch_pexels_video,
     "Stock Photos (Pexels)": fetch_pexels_photo,
     "Pixabay Video Footage": fetch_pixabay_video,
@@ -985,13 +1053,19 @@ if "catalog_search_results" not in st.session_state:
 if "catalog_search_query" not in st.session_state:
     st.session_state.catalog_search_query = ""
 
+# Web Image Explorer State
+if "web_search_results" not in st.session_state:
+    st.session_state.web_search_results = []
+if "web_search_query" not in st.session_state:
+    st.session_state.web_search_query = ""
+
 # =====================================================================
 # AUTHENTICATED WORKSPACE
 # =====================================================================
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ DuckDuckGo Web Imagery + Modern Stock + Public Domain (LOC, NARA) + Visit California + Stock Explorers")
+    st.caption("⚡ Open Web Media + Modern Stock + Public Domain (LOC, NARA) + Visit California + Stock Explorers")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -999,6 +1073,7 @@ with col_logout:
         st.session_state.batch_results = []
         st.session_state.zip_bytes = None
         st.session_state.catalog_search_results = []
+        st.session_state.web_search_results = []
         st.rerun()
 
 st.divider()
@@ -1020,6 +1095,7 @@ if st.session_state.last_tool_used != selected_tool_name:
     st.session_state.batch_results = []
     st.session_state.zip_bytes = None
     st.session_state.catalog_search_results = []
+    st.session_state.web_search_results = []
     st.session_state.last_tool_used = selected_tool_name
 
 with col_main:
@@ -1027,9 +1103,65 @@ with col_main:
     st.info(tool_info["desc"])
 
     # =================================================================
-    # TOOL A: 3-IMAGE ROW CATALOG EXPLORER (HOTLINK-BYPASSED PREVIEWS)
+    # TOOL A: WEB OPEN EXPLORER (3 RESULTS + INDIVIDUAL DOWNLOAD)
     # =================================================================
-    if tool_info["type"] == "catalog_explorer":
+    if tool_info["type"] == "web_explorer":
+        st.markdown("#### 🔍 **Live Open Web Search**")
+        st.caption("Search across 700M+ open web images without API keys. Displays top 3 matches in a single row with preview and 1-click download buttons.")
+
+        col_search_bar, col_search_go = st.columns([3, 1])
+        with col_search_bar:
+            web_query = st.text_input(
+                "Enter Web Search Prompt:",
+                placeholder="e.g. panther creek park, moody foggy mountain forest road, retro diner neon sign",
+                label_visibility="collapsed"
+            )
+        with col_search_go:
+            run_web_search = st.button("🔍 **Search Images**", type="primary", use_container_width=True)
+
+        if run_web_search:
+            if not web_query.strip():
+                st.warning("Please enter a search prompt.")
+            else:
+                st.session_state.web_search_query = web_query.strip()
+                with st.spinner("Searching web images and retrieving previews..."):
+                    items = search_web_open_top3(web_query)
+                    st.session_state.web_search_results = items
+
+                if not items:
+                    st.error(f"No web images found for '{web_query}'. Try broader terms.")
+                else:
+                    st.success(f"✓ Displaying top 3 results for '{web_query}'!")
+
+        # Render exactly 3 photos in a single clean row with individual download buttons
+        if st.session_state.web_search_results:
+            st.markdown("---")
+            st.markdown(f"#### **Top 3 Web Results for: *\"{st.session_state.web_search_query}\"***")
+
+            items = st.session_state.web_search_results[:3]
+            cols = st.columns(3)
+
+            for idx, item in enumerate(items):
+                with cols[idx]:
+                    st.image(item["image_bytes"], use_container_width=True)
+                    st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
+
+                    clean_fname = prompt_to_clean_filename(f"{st.session_state.web_search_query}_{idx+1}", "jpg")
+                    st.download_button(
+                        label=f"⬇️ **Download Image #{idx+1}**",
+                        data=item["image_bytes"],
+                        file_name=clean_fname,
+                        mime="image/jpeg",
+                        key=f"dl_web_{idx}",
+                        type="primary" if idx == 0 else "secondary",
+                        use_container_width=True
+                    )
+                    st.link_button("🌐 Open Source URL", item["source_url"], use_container_width=True)
+
+    # =================================================================
+    # TOOL B: 3-IMAGE ROW CATALOG EXPLORER (ISTOCK / SHUTTERSTOCK)
+    # =================================================================
+    elif tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
         st.caption(f"Enter any visual prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
@@ -1118,7 +1250,7 @@ with col_main:
                     components.html(copy_component_html, height=85)
 
     # =================================================================
-    # TOOL B: STOCK & ARCHIVAL BATCH SOURCING
+    # TOOL C: STOCK & ARCHIVAL BATCH SOURCING
     # =================================================================
     else:
         auth_key_name = tool_info.get("auth_key")
@@ -1249,7 +1381,7 @@ with col_main:
                     # Download button for the exact trimmed file created on the server
                     if r.get("file_bytes"):
                         st.download_button(
-                            label=f"⬇️️ **Download {r['filename']}**",
+                            label=f"⬇️ **Download {r['filename']}**",
                             data=r["file_bytes"],
                             file_name=r["filename"],
                             mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
