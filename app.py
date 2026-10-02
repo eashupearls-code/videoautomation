@@ -31,6 +31,7 @@ def get_secret(key: str, default: str = "") -> str:
 PEXELS_API_KEY = get_secret("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = get_secret("PIXABAY_API_KEY", "")
 UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
+MAPILLARY_CLIENT_TOKEN = get_secret("MAPILLARY_CLIENT_TOKEN", "")
 
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -48,7 +49,7 @@ ARCHIVAL_MODIFIERS = {
 }
 
 # =====================================================================
-# REPOSITORIES & TOOLS (DOWNLOADERS EXCLUDED)
+# REPOSITORIES & TOOLS
 # =====================================================================
 TOOLS = {
     "Stock Video Footage (Pexels)": {
@@ -115,6 +116,22 @@ TOOLS = {
         "auth_key": None,
         "archival": True
     },
+    "Mapillary Street-Level Imagery": {
+        "tag": "mapillary_photo",
+        "ext": "jpg",
+        "desc": "Famous for: Global crowdsourced street-level photography, urban point-of-view driving perspectives, and real-world road views.",
+        "type": "photo",
+        "auth_key": "MAPILLARY_CLIENT_TOKEN",
+        "archival": False
+    },
+    "KartaView Street-Level Imagery": {
+        "tag": "kartaview_photo",
+        "ext": "jpg",
+        "desc": "Famous for: Open street-level mapping photography, highway sequences, and urban road perspectives (No API key required).",
+        "type": "photo",
+        "auth_key": None,
+        "archival": False
+    },
     "iStock Photo Explorer (Search & Copy URL)": {
         "tag": "istock_search",
         "ext": "jpg",
@@ -136,7 +153,95 @@ TOOLS = {
 }
 
 # =====================================================================
-# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-IMAGE ROW)
+# GEOCODING HELPER FOR STREET-LEVEL ENGINES
+# =====================================================================
+def geocode_place_to_bbox(query: str, delta: float = 0.05) -> tuple[float, float, float, float] | None:
+    """
+    Geocodes city, neighborhood, or landmark into a bounding box (min_lon, min_lat, max_lon, max_lat)
+    via OpenStreetMap Nominatim.
+    """
+    clean_q = re.sub(r"[^\w\s,.-]", " ", query).strip()
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": clean_q, "format": "json", "limit": 1}
+    headers = {"User-Agent": "BrollStudioArchive/4.0 (contact@studio.local)"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        if r.status_code == 200:
+            hits = r.json()
+            if hits:
+                lat = float(hits[0]["lat"])
+                lon = float(hits[0]["lon"])
+                return (lon - delta, lat - delta, lon + delta, lat + delta)
+    except Exception:
+        pass
+    return None
+
+# =====================================================================
+# MAPILLARY & KARTAVIEW FETCH ENGINES
+# =====================================================================
+def fetch_mapillary_image(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
+    token = MAPILLARY_CLIENT_TOKEN
+    if not token:
+        return False, "MAPILLARY_CLIENT_TOKEN missing from secrets", None
+
+    bbox = geocode_place_to_bbox(query)
+    if not bbox:
+        bbox = (-74.02, 40.70, -73.97, 40.76)  # Default fallback: New York City
+
+    bbox_str = f"{bbox[0]:.4f},{bbox[1]:.4f},{bbox[2]:.4f},{bbox[3]:.4f}"
+    url = f"https://graph.mapillary.com/images?access_token={token}&fields=id,thumb_2048_url,thumb_1024_url&bbox={bbox_str}&limit=5"
+    try:
+        r = requests.get(url, timeout=12)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            for item in data:
+                img_url = item.get("thumb_2048_url") or item.get("thumb_1024_url")
+                if img_url:
+                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+                    if ok:
+                        return True, detail, img_url
+        return False, f"No Mapillary street images found for location: {query}", None
+    except Exception as e:
+        return False, str(e), None
+
+
+def fetch_kartaview_image(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
+    bbox = geocode_place_to_bbox(query)
+    if not bbox:
+        bbox = (-122.45, 37.75, -122.38, 37.80)  # Default fallback: San Francisco
+
+    url = "https://api.openstreetcam.org/2.0/photo"
+    params = {
+        "bLbrLat": bbox[1],
+        "bLbrLng": bbox[0],
+        "tLtrLat": bbox[3],
+        "tLtrLng": bbox[2],
+        "itemsPerPage": 5
+    }
+    headers = {"User-Agent": GLOBAL_USER_AGENT}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        if r.status_code == 200:
+            photos = r.json().get("result", {}).get("data", [])
+            for p in photos:
+                img_url = (
+                    p.get("imagePath")
+                    or p.get("fileurlLKey")
+                    or p.get("fileurlProc")
+                    or p.get("fileurl")
+                )
+                if img_url:
+                    if not img_url.startswith("http"):
+                        img_url = f"https://kartaview.org/{img_url.lstrip('/')}"
+                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+                    if ok:
+                        return True, detail, img_url
+        return False, f"No KartaView street images found for location: {query}", None
+    except Exception as e:
+        return False, str(e), None
+
+# =====================================================================
+# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-BOX ROW)
 # =====================================================================
 def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
     headers = {
@@ -146,7 +251,7 @@ def download_image_buffer(url: str, referer: str = "https://www.google.com/") ->
     }
     try:
         r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and len(r.content) > 1500:
+        if r.status_code == 200 and len(r.content) > 1000:
             return r.content
     except Exception:
         pass
@@ -184,7 +289,7 @@ def search_istock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # Unsplash fallback if iStock blocks server IP
+    # Unsplash fallback
     if not results:
         headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
         try:
@@ -209,7 +314,6 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
 
-    # Method 1: Shutterstock Next.js Search Hydration Endpoint
     api_url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
     headers_api = {
         "User-Agent": GLOBAL_USER_AGENT,
@@ -244,7 +348,6 @@ def search_shutterstock_top3(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # Method 2: HTML Search Parsing
     if len(results) < 3:
         try:
             h_url = f"https://www.shutterstock.com/search/{clean_q}"
@@ -274,7 +377,6 @@ def search_shutterstock_top3(query: str) -> list[dict]:
         except Exception:
             pass
 
-    # Method 3: Clean Fallback
     if len(results) < 3:
         try:
             api_url = f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={clean_q}&image_type=photo&per_page=3"
@@ -295,7 +397,6 @@ def search_shutterstock_top3(query: str) -> list[dict]:
             pass
 
     return results
-
 
 # =====================================================================
 # QUERY ENGINE & SANITIZATION
@@ -364,9 +465,36 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
         return False, str(e)
 
 
+# =====================================================================
+# GUARANTEED PRECISE 10s/15s SLICE PIPELINE
+# =====================================================================
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
+    cmd = [
+        FFMPEG_EXE, "-y",
+        "-user_agent", GLOBAL_USER_AGENT,
+        "-ss", "00:00:00",
+        "-i", cdn_url,
+        "-t", str(duration_sec),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            sz_mb = os.path.getsize(output_path) / (1024 * 1024)
+            return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
+    except Exception:
+        pass
+
+    # Stream-copy fallback
     cmd_copy = [
         FFMPEG_EXE, "-y",
+        "-user_agent", GLOBAL_USER_AGENT,
         "-ss", "00:00:00",
         "-i", cdn_url,
         "-t", str(duration_sec),
@@ -375,14 +503,14 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
         output_path
     ]
     try:
-        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=18)
+        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             sz_mb = os.path.getsize(output_path) / (1024 * 1024)
             return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
-    except Exception:
-        pass
+    except Exception as e:
+        return False, f"Trimming error: {e}"
 
-    return download_stream(cdn_url, output_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+    return False, "Could not slice video to specified duration."
 
 
 # =====================================================================
@@ -655,7 +783,9 @@ ENGINE_MAP = {
     "Unsplash Editorial Photos": fetch_unsplash_photo,
     "Wikimedia Commons Stills": fetch_wikimedia_stills,
     "Library of Congress (Historic Film & Video)": fetch_loc_video,
-    "Library of Congress (Historic Photos)": fetch_loc_photo
+    "Library of Congress (Historic Photos)": fetch_loc_photo,
+    "Mapillary Street-Level Imagery": fetch_mapillary_image,
+    "KartaView Street-Level Imagery": fetch_kartaview_image
 }
 
 
@@ -679,6 +809,14 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
 
     elapsed = time.time() - t0
 
+    file_bytes = None
+    if ok and os.path.exists(out_path):
+        try:
+            with open(out_path, "rb") as f:
+                file_bytes = f.read()
+        except Exception:
+            pass
+
     return {
         "prompt": prompt,
         "filename": filename,
@@ -687,6 +825,7 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
         "ok": ok,
         "detail": detail,
         "cdn_url": cdn_url,
+        "file_bytes": file_bytes,
         "elapsed": elapsed
     }
 
@@ -731,7 +870,7 @@ if "authenticated" not in st.session_state:
 
 if not st.session_state.authenticated:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("High-speed B-roll, public domain & stock portal pipeline for documentary research.")
+    st.caption("High-speed B-roll, street-level & stock portal pipeline for documentary research.")
     st.divider()
 
     _, col_login, _ = st.columns([1, 1.2, 1])
@@ -773,7 +912,7 @@ if "catalog_search_query" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives + Stock Search & Link Extractors")
+    st.caption("⚡ Modern Stock + Public Domain Archives + Mapillary/KartaView Street Views + Stock Explorers")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
@@ -814,7 +953,7 @@ with col_main:
     if tool_info["type"] == "catalog_explorer":
         source_brand = tool_info["source"]
         st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
-        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single clean row, and let you copy the URL with 1-click.")
+        st.caption(f"Enter any visual prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single row, and let you copy the URL with 1-click.")
 
         col_search_bar, col_search_go = st.columns([3, 1])
         with col_search_bar:
@@ -907,7 +1046,7 @@ with col_main:
         if auth_key_name:
             current_key = globals().get(auth_key_name, "")
             if not current_key:
-                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
+                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault. Add it to enable downloads.")
 
         quality_choice = "1080p Full HD"
         clip_seconds = 10
@@ -938,11 +1077,16 @@ with col_main:
                     label_visibility="collapsed"
                 )
 
-        st.markdown("**Visual Prompts (one prompt per line)**")
+        st.markdown("**Visual / Location Prompts (one prompt per line)**")
+        prompt_placeholder = (
+            "Times Square New York\nShibuya Crossing Tokyo\nChamps-Elysees Paris"
+            if "Street-Level" in selected_tool_name
+            else "wright brothers first flight kitty hawk\ncivil war battlefield photography\nmodern corporate boardroom meeting"
+        )
         prompt_input = st.text_area(
             "Visual Prompts",
             height=160,
-            placeholder="wright brothers first flight kitty hawk\ncivil war battlefield photography\nmodern corporate boardroom meeting",
+            placeholder=prompt_placeholder,
             label_visibility="collapsed"
         )
 
@@ -993,75 +1137,10 @@ with col_main:
             if successful:
                 st.markdown("### **Download Your Sourced Assets**")
 
-                cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
-
-                if cdn_links:
-                    js_code = """
-                    <script>
-                    async function downloadOneByOne() {
-                        const links = """ + str(cdn_links) + """;
-                        const btn = document.getElementById('seqBtn');
-                        btn.disabled = true;
-                        btn.style.opacity = '0.6';
-
-                        for (let i = 0; i < links.length; i++) {
-                            const item = links[i];
-                            btn.innerText = '⚡ Downloading (' + (i + 1) + '/' + links.length + ')...';
-                            try {
-                                const res = await fetch(item.url);
-                                const blob = await res.blob();
-                                const blobUrl = window.URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.style.display = 'none';
-                                a.href = blobUrl;
-                                a.download = item.name;
-                                document.body.appendChild(a);
-                                a.click();
-                                window.URL.revokeObjectURL(blobUrl);
-                                document.body.removeChild(a);
-                            } catch (err) {
-                                const a = document.createElement('a');
-                                a.href = item.url;
-                                a.download = item.name;
-                                a.target = '_blank';
-                                document.body.appendChild(a);
-                                a.click();
-                                document.body.removeChild(a);
-                            }
-                            if (i < links.length - 1) {
-                                await new Promise(r => setTimeout(r, 2000));
-                            }
-                        }
-
-                        btn.disabled = false;
-                        btn.style.opacity = '1';
-                        btn.innerText = '✓ All Files Downloaded!';
-                    }
-                    </script>
-                    <div style="padding: 2px 0;">
-                        <button id="seqBtn" onclick="downloadOneByOne()" style="
-                            background: linear-gradient(135deg, #00C853 0%, #009624 100%);
-                            color: white;
-                            border: none;
-                            padding: 13px 20px;
-                            font-size: 15px;
-                            font-weight: 700;
-                            border-radius: 8px;
-                            cursor: pointer;
-                            width: 100%;
-                            margin-bottom: 6px;
-                            box-shadow: 0 4px 6px rgba(0,0,0,0.12);
-                        ">
-                            ⚡ Download One-by-One (2s Gap - Max Regional Speed)
-                        </button>
-                    </div>
-                    """
-                    components.html(js_code, height=65)
-
                 if st.session_state.zip_bytes:
                     zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
                     st.download_button(
-                        label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB]**",
+                        label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB Total]**",
                         data=st.session_state.zip_bytes,
                         file_name="broll_assets.zip",
                         mime="application/zip",
@@ -1070,7 +1149,7 @@ with col_main:
                     )
 
             st.divider()
-            st.markdown("#### **Sourced File Status & Previews**")
+            st.markdown("#### **Sourced File Status & Individual Downloads**")
 
             for r in failed:
                 st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
@@ -1087,6 +1166,19 @@ with col_main:
                     st.markdown(f"**Prompt:** {r['prompt']}")
                     st.markdown(f"**Filename:** `{r['filename']}`")
                     st.caption(f"File Size: {r['detail']}")
+
+                    # Download button for exact trimmed file created on the server
+                    if r.get("file_bytes"):
+                        st.download_button(
+                            label=f"⬇️ **Download {r['filename']}**",
+                            data=r["file_bytes"],
+                            file_name=r["filename"],
+                            mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
+                            key=f"dl_single_{r['filename']}",
+                            type="secondary",
+                            use_container_width=True
+                        )
+
                     if r.get("cdn_url"):
                         st.link_button("🌐 Open Source File", r["cdn_url"], use_container_width=True)
                 st.write("---")
